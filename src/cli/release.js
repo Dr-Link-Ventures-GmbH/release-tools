@@ -30,18 +30,24 @@ const ENVIRONMENTS = ['development', 'testing', 'staging', 'production'];
 const BUMPS = ['none', 'patch', 'minor', 'major'];
 
 async function promptEnvironment() {
-  const answer = (await ask('🌍 Welche Umgebung? (development, testing, staging, production): ')).trim().toLowerCase();
+  const map = { "1": "development", "2": "testing", "3": "staging", "4": "production" };
+  const answer = (await ask("🌍 Umgebung? (1=dev, 2=test, 3=stag, 4=prod): ")).trim().toLowerCase();
+  if (map[answer]) return map[answer];
   if (ENVIRONMENTS.includes(answer)) return answer;
-  console.log('⚠️ Ungültig, Default: staging');
-  return 'staging';
+  console.log("⚠️ Ungültig, Default: staging");
+  return "staging";
 }
 
+
 async function promptBump() {
-  const answer = (await ask('🔢 Welcher Versionssprung? (none, patch, minor, major): ')).trim().toLowerCase();
+  const map = { "0": "none", "1": "patch", "2": "minor", "3": "major" };
+  const answer = (await ask("🔢 Versionssprung? (0=none, 1=patch, 2=minor, 3=major): ")).trim().toLowerCase();
+  if (map[answer]) return map[answer];
   if (BUMPS.includes(answer)) return answer;
-  console.log('⚠️ Ungültig, Default: patch');
-  return 'patch';
+  console.log("⚠️ Ungültig, Default: patch");
+  return "patch";
 }
+
 
 function ensureCleanWorkingTree() {
   const status = execOut('git status --porcelain');
