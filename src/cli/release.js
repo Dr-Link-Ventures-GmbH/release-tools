@@ -30,8 +30,8 @@ const ENVIRONMENTS = ['development', 'testing', 'staging', 'production'];
 const BUMPS = ['none', 'patch', 'minor', 'major'];
 
 async function promptEnvironment() {
-  const map = { "1": "development", "2": "testing", "3": "staging", "4": "production" };
-  const answer = (await ask("🌍 Umgebung? (1=dev, 2=test, 3=stag, 4=prod): ")).trim().toLowerCase();
+  const map = { "0": "development", "1": "testing", "2": "staging", "3": "production" };
+  const answer = (await ask("🌍 Umgebung? (0=dev, 1=test, 2=stag, 3=prod): ")).trim().toLowerCase();
   if (map[answer]) return map[answer];
   if (ENVIRONMENTS.includes(answer)) return answer;
   console.log("⚠️ Ungültig, Default: staging");
