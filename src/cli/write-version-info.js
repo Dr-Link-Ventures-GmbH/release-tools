@@ -48,11 +48,11 @@ const wwwDir = process.env.WWW_DIR
 
 const versionInfoPath = process.env.VERSION_INFO_FILE
   ? path.resolve(projectRoot, process.env.VERSION_INFO_FILE)
-  : path.join(wwwDir, "version.info");
+  : path.join(wwwDir, "version.json");
 
 const buildInfoPath = process.env.BUILD_INFO_FILE
   ? path.resolve(projectRoot, process.env.BUILD_INFO_FILE)
-  : path.join(wwwDir, "build.info");
+  : path.join(wwwDir, "build.json");
 
 // Version-Quelle (Reihenfolge):
 // 1) ENV VERSION
