@@ -2,6 +2,7 @@
 
 import { execSync } from 'child_process';
 import readline from 'readline';
+import fs from 'fs';
 
 function exec(cmd, opts = {}) {
   try {
@@ -38,7 +39,6 @@ async function promptEnvironment() {
   return "staging";
 }
 
-
 async function promptBump() {
   const map = { "0": "none", "1": "patch", "2": "minor", "3": "major" };
   const answer = (await ask("🔢 Versionssprung? (0=none, 1=patch, 2=minor, 3=major): ")).trim().toLowerCase();
@@ -47,7 +47,6 @@ async function promptBump() {
   console.log("⚠️ Ungültig, Default: patch");
   return "patch";
 }
-
 
 function ensureCleanWorkingTree() {
   const status = execOut('git status --porcelain');
@@ -65,6 +64,19 @@ function getVersionFromPackageJson() {
     ).toString()
   );
   return pkg.version;
+}
+
+function syncVersionJsonIfPresent(version) {
+  if (!fs.existsSync('version.json')) return;
+
+  fs.writeFileSync('version.json', JSON.stringify({ version }, null, 2) + '\n');
+  exec('git add version.json');
+
+  const staged = execOut('git diff --cached --name-only');
+  if (staged.includes('version.json')) {
+    exec(`git commit -m "sync version.json to ${version}"`);
+    exec('git push origin main');
+  }
 }
 
 async function main() {
@@ -86,6 +98,9 @@ async function main() {
     console.log(`🏷️ npm version ${bump} ...`);
     exec(`npm version ${bump}`);
     version = getVersionFromPackageJson();
+
+    // ✅ NEW: keep version.json in sync if the project uses it
+    syncVersionJsonIfPresent(version);
   } else {
     console.log(`🔁 Reusing current version: ${version}`);
   }
