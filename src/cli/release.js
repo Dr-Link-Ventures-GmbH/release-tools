@@ -113,10 +113,16 @@ async function main() {
   exec('npm run build');
 
   console.log('🧾 Write version.info/build.info ...');
-  exec(`node node_modules/@betaos/release-tools/src/cli/write-version-info.js`, {
-    env: { ...process.env, WWW_DIR: 'www' }
-  });
-
+  exec(
+    'node node_modules/@betaos/release-tools/src/cli/write-version-info.js',
+    {
+      env: {
+        ...process.env,
+        WWW_DIR: 'localdev/www'
+      }
+    }
+  );
+  
   console.log(`🚀 Deploy (${env}) ...`);
   exec(`node node_modules/@betaos/release-tools/src/cli/deploy.js ${env}`);
 
