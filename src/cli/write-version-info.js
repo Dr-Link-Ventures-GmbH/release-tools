@@ -1,4 +1,4 @@
-// scripts/write-version-info.js
+// src/cli/write-build-info.js
 import fs from "fs";
 import path from "path";
 import { execSync } from "child_process";
@@ -11,29 +11,6 @@ function safeExec(cmd, fallback = null) {
   }
 }
 
-function fileExists(p) {
-  try {
-    fs.accessSync(p, fs.constants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function readJsonIfExists(p) {
-  if (!fileExists(p)) return null;
-  try {
-    return JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-function writeTextFile(targetPath, content) {
-  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-  fs.writeFileSync(targetPath, content, "utf8");
-}
-
 function writeJsonFile(targetPath, obj) {
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   fs.writeFileSync(targetPath, JSON.stringify(obj, null, 2) + "\n", "utf8");
@@ -41,79 +18,59 @@ function writeJsonFile(targetPath, obj) {
 
 const projectRoot = process.cwd();
 
-// Ziel: www/version.info (default) und optional www/build.info
+// Zielverzeichnis MUSS explizit gesetzt werden
 const wwwDir = process.env.WWW_DIR
   ? path.resolve(projectRoot, process.env.WWW_DIR)
-  : path.resolve(projectRoot, "www");
+  : (() => {
+      console.error("❌ WWW_DIR not set");
+      process.exit(1);
+    })();
 
-const versionInfoPath = process.env.VERSION_INFO_FILE
-  ? path.resolve(projectRoot, process.env.VERSION_INFO_FILE)
-  : path.join(wwwDir, "version.json");
+const buildInfoPath = path.join(wwwDir, "build.info");
 
-const buildInfoPath = process.env.BUILD_INFO_FILE
-  ? path.resolve(projectRoot, process.env.BUILD_INFO_FILE)
-  : path.join(wwwDir, "build.json");
-
-// Version-Quelle (Reihenfolge):
-// 1) ENV VERSION
-// 2) version.json { "version": "x.y.z" }
-// 3) package.json { "version": "x.y.z" } (falls vorhanden)
-// 4) git describe --tags --abbrev=0
-// 5) fallback: "0.0.0"
-const envVersion = (process.env.VERSION || "").trim();
-
-const versionJson = readJsonIfExists(path.join(projectRoot, "version.json"));
-const packageJson = readJsonIfExists(path.join(projectRoot, "package.json"));
-
-const lastTag = safeExec("git describe --tags --abbrev=0", null);
+// Version-Quelle (klar definiert):
+// 1) ENV VERSION (vom Release-CLI)
+// 2) version.json
+// 3) package.json
+// 4) letzter Git-Tag
+// 5) Fallback
+function readJsonIfExists(p) {
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {
+    return null;
+  }
+}
 
 const version =
-  envVersion ||
-  (versionJson && typeof versionJson.version === "string" && versionJson.version.trim()) ||
-  (packageJson && typeof packageJson.version === "string" && packageJson.version.trim()) ||
-  lastTag ||
+  process.env.VERSION ||
+  readJsonIfExists(path.join(projectRoot, "version.json"))?.version ||
+  readJsonIfExists(path.join(projectRoot, "package.json"))?.version ||
+  safeExec("git describe --tags --abbrev=0", null) ||
   "0.0.0";
 
-// Git Metadaten
-const commit = safeExec("git rev-parse --short HEAD", "unknown");
-const branch = safeExec("git rev-parse --abbrev-ref HEAD", "unknown");
+// Git-Metadaten
+const commit   = safeExec("git rev-parse --short HEAD", "unknown");
+const branch   = safeExec("git rev-parse --abbrev-ref HEAD", "unknown");
 const upstream = safeExec("git config --get remote.origin.url", "unknown");
-const dirty = !!safeExec("git status --porcelain", "");
+const dirty    = !!safeExec("git status --porcelain", "");
 
-// Zeit
-const builtAt = new Date().toISOString();
-
-// Optional: Changes seit letztem Tag
-const changes =
-  lastTag
-    ? safeExec(`git log ${lastTag}..HEAD --pretty=format:"%h %s"`, "")
-        .split("\n")
-        .filter(Boolean)
-    : [];
+// Zeit / Laufzeit
+const buildInfo = {
+  version,
+  commit,
+  branch,
+  builtAt: new Date().toISOString(),
+  nodeVersion: process.version,
+  user: process.env.USER || process.env.USERNAME || "unknown",
+  dirty,
+  upstream
+};
 
 try {
-  // version.info als Plaintext, so wie man es gerne minimalistisch ausliest
-  writeTextFile(versionInfoPath, `${version}\n`);
-
-  // build.info als JSON (optional, aber sehr praktisch)
-  const buildInfo = {
-    version,
-    commit,
-    branch,
-    builtAt,
-    nodeVersion: process.version,
-    user: process.env.USER || process.env.USERNAME || "unknown",
-    dirty,
-    upstream,
-    lastTag: lastTag || "(none)",
-    changes
-  };
-
   writeJsonFile(buildInfoPath, buildInfo);
-
-  console.log(`📦 version.info → ${path.relative(projectRoot, versionInfoPath)} (${version})`);
-  console.log(`📦 build.info   → ${path.relative(projectRoot, buildInfoPath)} (${commit})`);
+  console.log(`📦 build.info written → ${path.relative(projectRoot, buildInfoPath)}`);
 } catch (err) {
-  console.error("❌ Failed to write version/build info:", err?.message || err);
+  console.error("❌ Failed to write build.info:", err?.message || err);
   process.exit(1);
 }
