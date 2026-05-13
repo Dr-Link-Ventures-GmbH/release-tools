@@ -68,7 +68,27 @@ import loadProjectBootstrap from '../core/load-project-bootstrap.js';
         await ssh.putFile(item.path, remoteTargetFile);
       }
 
+      // Force world-read on uploaded files (umask on remote can produce 660 — Apache www-data needs o+r)
+      if (item.isDir) {
+        await ssh.execCommand(
+          `find ${remoteTargetDir} -type f ! -perm -o+r -exec chmod o+r {} +; ` +
+          `find ${remoteTargetDir} -type d ! -perm -o+rx -exec chmod o+rx {} +`
+        );
+      } else {
+        await ssh.execCommand(`chmod o+r ${remoteTargetFile}`);
+      }
+
       console.log(`✅ Uploaded ${item.path}`);
+    }
+
+    // Run comoposer remotely, if required through ENV
+    if (process.env.DEPLOY_RUN_COMPOSER === '1') {
+      console.log('📦 Running composer install remotely ...');
+      const { stdout, stderr } = await ssh.execCommand(
+        `cd ${remoteBase} && composer install --no-dev --optimize-autoloader`
+      );
+      if (stdout) console.log(stdout);
+      if (stderr) console.error(stderr);
     }
 
     ssh.dispose();
