@@ -68,16 +68,6 @@ import loadProjectBootstrap from '../core/load-project-bootstrap.js';
         await ssh.putFile(item.path, remoteTargetFile);
       }
 
-      // Force world-read on uploaded files (umask on remote can produce 660 — Apache www-data needs o+r)
-      if (item.isDir) {
-        await ssh.execCommand(
-          `find ${remoteTargetDir} -type f ! -perm -o+r -exec chmod o+r {} +; ` +
-          `find ${remoteTargetDir} -type d ! -perm -o+rx -exec chmod o+rx {} +`
-        );
-      } else {
-        await ssh.execCommand(`chmod o+r ${remoteTargetFile}`);
-      }
-
       console.log(`✅ Uploaded ${item.path}`);
     }
 
