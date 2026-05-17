@@ -75,7 +75,9 @@ export default function makeBootstrap(config) {
       ? JSON.parse(fs.readFileSync(packageJsonFile, 'utf8'))
       : {};
 
-    const envFile = path.join(rootDir, `.env.${target || (config.defaultTarget ?? 'staging')}`);
+    const envFile = config.envFile
+      ? path.join(rootDir, config.envFile)
+      : path.join(rootDir, `.env.${target || (config.defaultTarget ?? 'staging')}`);
 
     const deployItems = (config.deployItems ?? []).map(item => {
       const p = item.path.startsWith('.') || item.path.startsWith('/') || item.path.includes(':')
