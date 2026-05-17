@@ -1,4 +1,8 @@
 // src/core/bootstrap-factory.js
+//
+// Projects expose their release config via scripts/bootstrap.js by calling
+// makeBootstrap({...}). The returned Promise resolves to a bootstrap object
+// consumed by src/cli/release.js and src/cli/deploy.js.
 
 import path from 'path';
 import fs from 'fs';
@@ -9,6 +13,7 @@ function parseArgs(argv) {
   const flags = {
     silent: args.includes('--silent'),
     allowFail: args.includes('--allow-fail'),
+    noGit: args.includes('--no-git'),
   };
   const positionalArgs = args.filter(a => !a.startsWith('--'));
   return { args, flags, positionalArgs };
@@ -41,15 +46,24 @@ export default function makeBootstrap(config) {
   const remoteBasePath = config.remoteBasePath;
   if (!remoteBasePath) throw new Error('bootstrap config missing: remoteBasePath');
 
+  const repoBranch = config.repoBranch ?? 'main';
+  const distDir = config.distDir ?? 'dist';
+
   return (async () => {
     const { args, flags, positionalArgs } = parseArgs(process.argv);
 
     let target = positionalArgs.find(a => validTargets.includes(a)) ?? null;
 
-    const isReleaseScript = process.argv[1] && process.argv[1].endsWith('release.js');
-    if (isReleaseScript && !target) {
+    const argv1 = (process.argv[1] || '').replaceAll('\\', '/');
+    const isReleaseScript = argv1.endsWith('release.js');
+    const isDeployScript =
+      argv1.endsWith('deploy.js') ||
+      argv1.endsWith('deploy.mjs') ||
+      argv1.endsWith('deploy.cjs');
+
+    if ((isReleaseScript || isDeployScript) && !target) {
       target = await askChoice(
-        `Please enter target (${validTargets.join(', ')}): `,
+        `🎯 Target? (${validTargets.join(', ')}): `,
         validTargets,
         config.defaultTarget ?? 'staging'
       );
@@ -80,6 +94,8 @@ export default function makeBootstrap(config) {
       PACKAGE_JSON_FILE: packageJsonFile,
       ENV_FILE: envFile,
       REMOTE_BASE_PATH: remoteBasePath,
+      REPO_BRANCH: repoBranch,
+      DIST_DIR: path.join(rootDir, distDir),
       args,
       flags,
       target,

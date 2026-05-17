@@ -1,4 +1,9 @@
-// src/cli/write-build-info.js
+// src/cli/write-version-info.js
+//
+// Writes <DIST_DIR>/build.info with package version, git metadata and
+// build timestamp. Called from release.js after `npm run build` so the
+// file ends up in the deployed bundle.
+
 import fs from "fs";
 import path from "path";
 import { execSync } from "child_process";
@@ -16,24 +21,6 @@ function writeJsonFile(targetPath, obj) {
   fs.writeFileSync(targetPath, JSON.stringify(obj, null, 2) + "\n", "utf8");
 }
 
-const projectRoot = process.cwd();
-
-// Zielverzeichnis MUSS explizit gesetzt werden
-const wwwDir = process.env.WWW_DIR
-  ? path.resolve(projectRoot, process.env.WWW_DIR)
-  : (() => {
-      console.error("❌ WWW_DIR not set");
-      process.exit(1);
-    })();
-
-const buildInfoPath = path.join(wwwDir, "build.info");
-
-// Version-Quelle (klar definiert):
-// 1) ENV VERSION (vom Release-CLI)
-// 2) version.json
-// 3) package.json
-// 4) letzter Git-Tag
-// 5) Fallback
 function readJsonIfExists(p) {
   try {
     return JSON.parse(fs.readFileSync(p, "utf8"));
@@ -42,6 +29,22 @@ function readJsonIfExists(p) {
   }
 }
 
+const projectRoot = process.cwd();
+
+// Output directory: explicit override via DIST_DIR env (set by release.js
+// from the project bootstrap), otherwise default to ./dist
+const distDir = process.env.DIST_DIR
+  ? path.resolve(projectRoot, process.env.DIST_DIR)
+  : path.join(projectRoot, "dist");
+
+const buildInfoPath = path.join(distDir, "build.info");
+
+// Version source priority:
+// 1) ENV VERSION (passed by release.js)
+// 2) version.json
+// 3) package.json
+// 4) latest git tag
+// 5) fallback
 const version =
   process.env.VERSION ||
   readJsonIfExists(path.join(projectRoot, "version.json"))?.version ||
@@ -49,13 +52,11 @@ const version =
   safeExec("git describe --tags --abbrev=0", null) ||
   "0.0.0";
 
-// Git-Metadaten
 const commit   = safeExec("git rev-parse --short HEAD", "unknown");
 const branch   = safeExec("git rev-parse --abbrev-ref HEAD", "unknown");
 const upstream = safeExec("git config --get remote.origin.url", "unknown");
 const dirty    = !!safeExec("git status --porcelain", "");
 
-// Zeit / Laufzeit
 const buildInfo = {
   version,
   commit,
@@ -64,7 +65,7 @@ const buildInfo = {
   nodeVersion: process.version,
   user: process.env.USER || process.env.USERNAME || "unknown",
   dirty,
-  upstream
+  upstream,
 };
 
 try {
