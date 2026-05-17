@@ -1,15 +1,19 @@
 {
-  "name": "@betaos/release-tools",
-  "version": "0.1.0",
+  "name": "@linkventures/release-tools",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Shared release & deploy tooling for BetaOS projects",
+  "description": "Shared release & deploy tooling for Link Ventures projects",
   "main": "src/cli/release.js",
   "bin": {
-    "betaos-release": "src/cli/release.js"
+    "release-tools": "src/cli/release.js"
   },
   "scripts": {
     "release": "node src/cli/release.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dr-Link-Ventures-GmbH/release-tools.git"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
