@@ -103,6 +103,8 @@ export default function makeBootstrap(config) {
       target,
       packageJson,
       DEPLOY_ITEMS: deployItems,
+      RUN_COMPOSER: !!config.runComposer,
+      POST_DEPLOY_COMMANDS: Array.isArray(config.postDeployCommands) ? config.postDeployCommands : [],
     };
   })();
 }

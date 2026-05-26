@@ -20,6 +20,8 @@ export async function runDeploy(bootstrap) {
     ENV_FILE,
     target,
     DEPLOY_ITEMS,
+    RUN_COMPOSER = false,
+    POST_DEPLOY_COMMANDS = [],
     flags = {},
   } = bootstrap;
 
@@ -108,13 +110,29 @@ export async function runDeploy(bootstrap) {
       log(`✅ Uploaded ${item.path}`);
     }
 
-    if (process.env.DEPLOY_RUN_COMPOSER === '1') {
+    if (RUN_COMPOSER || process.env.DEPLOY_RUN_COMPOSER === '1') {
       log('📦 Running composer install remotely ...');
       const { stdout, stderr } = await ssh.execCommand(
         `cd ${remoteBase} && composer install --no-dev --optimize-autoloader`
       );
       if (stdout) log(stdout);
       if (stderr) console.error(stderr);
+    }
+
+    // Post-deploy commands (z.B. "sudo systemctl reload apache2" für PHP-Opcache-Flush).
+    // Commands die mit "sudo " beginnen werden automatisch via SSH_SUDO_PASSWORD/SSH_PASSPHRASE gepiped.
+    for (const rawCmd of POST_DEPLOY_COMMANDS) {
+      const cmd = String(rawCmd || '').trim();
+      if (!cmd) continue;
+      let execCmd = cmd;
+      if (cmd.startsWith('sudo ')) {
+        const pwd = process.env.SSH_SUDO_PASSWORD || process.env.SSH_PASSPHRASE || '';
+        execCmd = `echo "${pwd}" | sudo -S ${cmd.slice(5)}`;
+      }
+      log(`🔧 Post-deploy: ${cmd}`);
+      const { stdout, stderr } = await ssh.execCommand(execCmd);
+      if (stdout) log(stdout.trim());
+      if (stderr && !stderr.includes('password for')) console.error(stderr.trim());
     }
   } finally {
     ssh.dispose();
