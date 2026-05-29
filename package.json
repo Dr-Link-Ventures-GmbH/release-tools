@@ -1,6 +1,6 @@
 {
   "name": "@linkventures/release-tools",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "description": "Shared release & deploy tooling for Link Ventures projects",

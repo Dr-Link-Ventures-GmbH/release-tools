@@ -88,6 +88,11 @@ export default function makeBootstrap(config) {
         path: p,
         isDir: !!item.isDir,
         remoteSubdir: item.remoteSubdir ?? '',
+        // Subdirectory names under the remote target that the clean-step
+        // should LEAVE ALONE. Used for runtime data (uploads/, config/)
+        // that lives inside the deploy target but is not part of the build.
+        // Without this, the default `rm -rf ${remoteTargetDir}` wipes them.
+        preserveSubdirs: Array.isArray(item.preserveSubdirs) ? item.preserveSubdirs : [],
       };
     });
 

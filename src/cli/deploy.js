@@ -79,8 +79,29 @@ export async function runDeploy(bootstrap) {
           process.exit(1);
         }
 
-        log(`🧹 Cleaning remote dir: ${remoteTargetDir}`);
-        const cleanRes = await ssh.execCommand(`rm -rf "${remoteTargetDir}" && mkdir -p "${remoteTargetDir}"`);
+        // Selective clean: when `preserveSubdirs` is set, wipe everything
+        // INSIDE the target except the named subdirs (e.g. uploads/). Without
+        // that list we keep the legacy `rm -rf ${remoteTargetDir}` behaviour.
+        // Why this matters: when the SSH user is not in the www-data group,
+        // rm -rf on a mixed-ownership tree fails silently on some subdirs
+        // (perm-denied is swallowed by rm) and succeeds on others — meaning
+        // runtime data living inside the target can get partially shredded.
+        // Hardcoded reference incident: NAKBase 2026-05-29 lost 89 image
+        // files because articles/ + misc/ were temruk-owned and got wiped
+        // while persons/ + divineservices/ (www-data-owned) survived.
+        const preserve = item.preserveSubdirs ?? [];
+        let cleanCmd;
+        if (preserve.length > 0) {
+          const notNames = preserve.map(s => `! -name ${JSON.stringify(s)}`).join(' ');
+          cleanCmd =
+            `mkdir -p "${remoteTargetDir}" && ` +
+            `find "${remoteTargetDir}" -mindepth 1 -maxdepth 1 ${notNames} -exec rm -rf {} +`;
+          log(`🧹 Cleaning remote dir (preserving: ${preserve.join(', ')}): ${remoteTargetDir}`);
+        } else {
+          cleanCmd = `rm -rf "${remoteTargetDir}" && mkdir -p "${remoteTargetDir}"`;
+          log(`🧹 Cleaning remote dir: ${remoteTargetDir}`);
+        }
+        const cleanRes = await ssh.execCommand(cleanCmd);
         if (cleanRes.stderr) console.error('❗ CLEAN STDERR:', cleanRes.stderr);
 
         log(`📤 Uploading folder ${item.path} → ${remoteTargetDir} ...`);
