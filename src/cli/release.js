@@ -2,7 +2,7 @@
 //
 // Release flow for projects using @linkventures/release-tools:
 //   1. Verify prerequisites (.env.<target> present)
-//   2. Switch to repo branch, pull --rebase, optionally merge feature branch
+//   2. Switch to repo branch, pull --ff-only, optionally merge feature branch
 //   3. Bump version (CalVer for --patch: YYYY.M.PATCH, npm semver for minor/major)
 //   4. npm run build (BUILD_TARGET env exposes the target to vite/webpack)
 //   5. Write dist/build.info
@@ -143,7 +143,13 @@ async function main() {
   if (!flags.noGit) {
     run(`git checkout ${REPO_BRANCH}`);
     run(`git fetch --tags`);
-    run(`git pull --rebase origin ${REPO_BRANCH}`);
+    // --ff-only, NOT --rebase: callers (e.g. NAKPortal's release-locked.mjs)
+    // may have prepared a local merge commit right before invoking us. A rebase
+    // pull would flatten that merge and rewrite the branch commits' SHAs, so
+    // branch tips never become ancestors of main (breaks `git branch -d` and
+    // any already-released checks). With a local merge pending, ff-only is a
+    // clean no-op; on true divergence it fails loudly instead of rewriting.
+    run(`git pull --ff-only origin ${REPO_BRANCH}`);
 
     const branch = await resolveBranch(args);
     if (branch) {
