@@ -9,6 +9,8 @@
 
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
+import { execSync } from 'child_process';
 import dotenv from 'dotenv';
 import { NodeSSH } from 'node-ssh';
 import { pathToFileURL } from 'url';
@@ -64,63 +66,73 @@ export async function runDeploy(bootstrap) {
       const remoteTargetFile = `${remoteTargetDir}/${path.basename(item.path)}`;
 
       if (item.isDir) {
-        log(`📁 Ensuring remote dir exists: ${remoteTargetDir}`);
-        const mkdirRes = await ssh.execCommand(`mkdir -p "${remoteTargetDir}"`);
-        if (mkdirRes.stderr) console.error('❗ MKDIR STDERR:', mkdirRes.stderr);
+        // Tar-based deploy: pack locally, upload ONE archive, unpack into a
+        // staging dir next to the target and swap directories. Hundreds of
+        // per-file SFTP round trips collapse into a single upload, and the
+        // swap (two mv calls) replaces the old rm-rf + slow re-upload window
+        // during which Apache served a half-empty dir.
+        const parent = path.posix.dirname(remoteTargetDir);
+        const base = path.posix.basename(remoteTargetDir);
+        const staging = `${remoteTargetDir}.staging`;
+        const trash = `${remoteTargetDir}.old-${Date.now()}`;
+        const remoteTar = `${parent}/.deploy-${base}.tgz`;
 
-        log('🧪 Permission check (touch .deploy-test)...');
-        const testFile = `${remoteTargetDir}/.deploy-test`;
+        log(`📦 Packing ${item.path} ...`);
+        const localTar = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'deploy-')), `${base}.tgz`);
+        execSync(`tar -czf "${localTar}" -C "${item.path}" .`, { stdio: 'inherit' });
+
+        log('🧪 Permission check (parent dir writable, remote tar present)...');
         const permRes = await ssh.execCommand(
-          `echo "ok" > "${testFile}" && rm -f "${testFile}" && echo "write-ok"`
+          `mkdir -p "${parent}" && echo ok > "${parent}/.deploy-test" && rm -f "${parent}/.deploy-test" && command -v tar >/dev/null && echo "write-ok"`
         );
         if (!permRes.stdout.includes('write-ok')) {
-          console.error('❌ No write permission in remote target directory.');
+          console.error('❌ Parent dir not writable or remote tar missing.');
           if (permRes.stderr) console.error('   STDERR:', permRes.stderr);
           process.exit(1);
         }
 
-        // Selective clean: when `preserveSubdirs` is set, wipe everything
-        // INSIDE the target except the named subdirs (e.g. uploads/). Without
-        // that list we keep the legacy `rm -rf ${remoteTargetDir}` behaviour.
-        // Why this matters: when the SSH user is not in the www-data group,
-        // rm -rf on a mixed-ownership tree fails silently on some subdirs
-        // (perm-denied is swallowed by rm) and succeeds on others — meaning
-        // runtime data living inside the target can get partially shredded.
-        // Hardcoded reference incident: NAKBase 2026-05-29 lost 89 image
-        // files because articles/ + misc/ were temruk-owned and got wiped
-        // while persons/ + divineservices/ (www-data-owned) survived.
-        const preserve = item.preserveSubdirs ?? [];
-        let cleanCmd;
-        if (preserve.length > 0) {
-          const notNames = preserve.map(s => `! -name ${JSON.stringify(s)}`).join(' ');
-          cleanCmd =
-            `mkdir -p "${remoteTargetDir}" && ` +
-            `find "${remoteTargetDir}" -mindepth 1 -maxdepth 1 ${notNames} -exec rm -rf {} +`;
-          log(`🧹 Cleaning remote dir (preserving: ${preserve.join(', ')}): ${remoteTargetDir}`);
-        } else {
-          cleanCmd = `rm -rf "${remoteTargetDir}" && mkdir -p "${remoteTargetDir}"`;
-          log(`🧹 Cleaning remote dir: ${remoteTargetDir}`);
-        }
-        const cleanRes = await ssh.execCommand(cleanCmd);
-        if (cleanRes.stderr) console.error('❗ CLEAN STDERR:', cleanRes.stderr);
+        log(`📤 Uploading archive → ${remoteTar} ...`);
+        await ssh.putFile(localTar, remoteTar);
+        fs.rmSync(path.dirname(localTar), { recursive: true, force: true });
 
-        log(`📤 Uploading folder ${item.path} → ${remoteTargetDir} ...`);
-        const ok = await ssh.putDirectory(item.path, remoteTargetDir, {
-          recursive: true,
-          concurrency: 5,
-          validate: () => true,
-          tick: (localPath, remotePath, error) => {
-            if (error) console.error('❌ Upload error:', { localPath, remotePath, message: error.message });
-          },
-        });
-
-        if (!ok) {
-          console.error('❌ Upload failed (putDirectory returned false).');
+        log(`📂 Unpacking into staging: ${staging}`);
+        const unpackRes = await ssh.execCommand(
+          `rm -rf "${staging}" && mkdir -p "${staging}" && tar -xzf "${remoteTar}" -C "${staging}" && rm -f "${remoteTar}" && chmod -R o+rX "${staging}" && echo "unpack-ok"`
+        );
+        if (!unpackRes.stdout.includes('unpack-ok')) {
+          console.error('❌ Remote unpack failed.');
+          if (unpackRes.stderr) console.error('   STDERR:', unpackRes.stderr);
           process.exit(1);
         }
 
-        // Apache (www-data) needs read on files, traverse (x) on dirs
-        await ssh.execCommand(`chmod -R o+rX "${remoteTargetDir}"`);
+        // Runtime data (preserveSubdirs, e.g. uploads/) moves from the live
+        // dir into staging BEFORE the swap, so it survives every deploy —
+        // same guarantee the old selective clean gave, without the
+        // mixed-ownership rm -rf hazard (NAKBase 2026-05-29: 89 image files
+        // lost because rm -rf silently skipped www-data-owned subdirs while
+        // shredding temruk-owned ones).
+        const preserve = item.preserveSubdirs ?? [];
+        for (const sub of preserve) {
+          const mvRes = await ssh.execCommand(
+            `if [ -e "${remoteTargetDir}/${sub}" ]; then rm -rf "${staging}/${sub}" && mv "${remoteTargetDir}/${sub}" "${staging}/${sub}" && echo "kept"; else echo "absent"; fi`
+          );
+          log(`♻️  preserve ${sub}: ${mvRes.stdout.trim() || mvRes.stderr.trim()}`);
+        }
+
+        log(`🔁 Swapping ${staging} → ${remoteTargetDir}`);
+        const swapRes = await ssh.execCommand(
+          `{ [ ! -e "${remoteTargetDir}" ] || mv "${remoteTargetDir}" "${trash}"; } && mv "${staging}" "${remoteTargetDir}" && echo "swap-ok"`
+        );
+        if (!swapRes.stdout.includes('swap-ok')) {
+          console.error('❌ Swap failed — the previous version may still be live.');
+          if (swapRes.stderr) console.error('   STDERR:', swapRes.stderr);
+          process.exit(1);
+        }
+
+        // Best-effort cleanup: a mixed-ownership .old dir may resist rm -rf;
+        // that's harmless, the new version is already live.
+        const rmRes = await ssh.execCommand(`rm -rf "${trash}"`);
+        if (rmRes.stderr) console.error('❗ OLD-DIR CLEANUP STDERR:', rmRes.stderr);
       } else {
         log(`📤 Uploading file ${item.path} → ${remoteTargetFile} ...`);
         await ssh.execCommand(`mkdir -p "${remoteTargetDir}"`);
