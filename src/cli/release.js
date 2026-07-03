@@ -15,7 +15,7 @@
 // Missing target/bump are prompted interactively. --no-git skips git
 // operations (useful for re-deploying the current build without bumping).
 
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import path from 'path';
@@ -187,8 +187,33 @@ async function main() {
     console.log(`🔁 Reusing current version: ${version}`);
   }
 
+  // 3b. Optional validation gate: RELEASE_VALIDATE_CMD runs CONCURRENTLY with
+  // the build (they don't depend on each other) but MUST be green before the
+  // deploy below — nothing unvalidated ever reaches the server, and the
+  // validation suite no longer adds its full duration to the release.
+  let validation = null;
+  const validateCmd = process.env.RELEASE_VALIDATE_CMD;
+  if (validateCmd) {
+    console.log(`🧪 Validation started in parallel: ${validateCmd}`);
+    validation = new Promise((resolve, reject) => {
+      const child = spawn(validateCmd, { shell: true, stdio: ['ignore', 'inherit', 'inherit'] });
+      child.on('close', (code) => code === 0
+        ? resolve()
+        : reject(new Error(`Validation failed (${validateCmd}, exit ${code}).`)));
+    });
+    // A rejection may occur while the build still runs; the await below picks
+    // it up. Prevent Node's unhandled-rejection warning in the meantime.
+    validation.catch(() => {});
+  }
+
   // 4. Build (BUILD_TARGET lets vite/webpack adjust behaviour per env)
   run('npm run build', { BUILD_TARGET: target });
+
+  if (validation) {
+    console.log('⏳ Waiting for validation to pass before deploying…');
+    await validation;
+    console.log('✅ Validation passed.');
+  }
 
   // 5. dist/build.info
   run(`node "${path.join(__dirname, 'write-version-info.js')}"`, {
