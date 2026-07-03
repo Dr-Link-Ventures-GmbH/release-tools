@@ -110,6 +110,7 @@ export default function makeBootstrap(config) {
       DEPLOY_ITEMS: deployItems,
       RUN_COMPOSER: !!config.runComposer,
       POST_DEPLOY_COMMANDS: Array.isArray(config.postDeployCommands) ? config.postDeployCommands : [],
+      VALIDATE_CMD: config.validateCmd || null,
     };
   })();
 }

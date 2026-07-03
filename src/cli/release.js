@@ -192,7 +192,7 @@ async function main() {
   // deploy below — nothing unvalidated ever reaches the server, and the
   // validation suite no longer adds its full duration to the release.
   let validation = null;
-  const validateCmd = process.env.RELEASE_VALIDATE_CMD;
+  const validateCmd = process.env.RELEASE_VALIDATE_CMD || bootstrap.VALIDATE_CMD;
   if (validateCmd) {
     console.log(`🧪 Validation started in parallel: ${validateCmd}`);
     validation = new Promise((resolve, reject) => {
