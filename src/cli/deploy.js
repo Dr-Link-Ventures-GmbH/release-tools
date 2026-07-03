@@ -79,7 +79,12 @@ export async function runDeploy(bootstrap) {
 
         log(`📦 Packing ${item.path} ...`);
         const localTar = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'deploy-')), `${base}.tgz`);
-        execSync(`tar -czf "${localTar}" -C "${item.path}" .`, { stdio: 'inherit' });
+        // On Windows, Git Bash's GNU tar parses "C:\..." as host:path
+        // ("Cannot connect to C"). The bundled bsdtar handles drive letters.
+        const tarBin = process.platform === 'win32'
+          ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
+          : 'tar';
+        execSync(`"${tarBin}" -czf "${localTar}" -C "${item.path}" .`, { stdio: 'inherit' });
 
         log('🧪 Permission check (parent dir writable, remote tar present)...');
         const permRes = await ssh.execCommand(
