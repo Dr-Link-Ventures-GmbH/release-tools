@@ -157,20 +157,28 @@ export async function runDeploy(bootstrap) {
       if (stderr) console.error(stderr);
     }
 
-    // Post-deploy commands (z.B. "sudo systemctl reload apache2" für PHP-Opcache-Flush).
-    // Commands die mit "sudo " beginnen werden automatisch via SSH_SUDO_PASSWORD/SSH_PASSPHRASE gepiped.
+    // Post-deploy commands (e.g. "sudo systemctl reload apache2" to flush the PHP opcache).
+    // A command starting with "sudo " gets SSH_SUDO_PASSWORD (fallback SSH_PASSPHRASE) on stdin — never on the
+    // command line, where it would show up in `ps` on the server (v0.5.4; before: echo "<pw>" | sudo -S …).
+    // Every command must exit 0, otherwise the release stops here (a failed restart is not a release).
     for (const rawCmd of POST_DEPLOY_COMMANDS) {
       const cmd = String(rawCmd || '').trim();
       if (!cmd) continue;
       let execCmd = cmd;
+      const opts = {};
       if (cmd.startsWith('sudo ')) {
         const pwd = process.env.SSH_SUDO_PASSWORD || process.env.SSH_PASSPHRASE || '';
-        execCmd = `echo "${pwd}" | sudo -S ${cmd.slice(5)}`;
+        execCmd = `sudo -S -p '' ${cmd.slice(5)}`;
+        opts.stdin = `${pwd}
+`;
       }
       log(`🔧 Post-deploy: ${cmd}`);
-      const { stdout, stderr } = await ssh.execCommand(execCmd);
+      const { stdout, stderr, code } = await ssh.execCommand(execCmd, opts);
       if (stdout) log(stdout.trim());
       if (stderr && !stderr.includes('password for')) console.error(stderr.trim());
+      if (code !== 0 && code !== null) {
+        throw new Error(`Post-deploy command failed (exit ${code}): ${cmd}`);
+      }
     }
   } finally {
     ssh.dispose();
