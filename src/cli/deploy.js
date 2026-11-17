@@ -135,10 +135,23 @@ export async function runDeploy(bootstrap) {
           throw new Error('Deploy step failed (see above).');
         }
 
-        // Best-effort cleanup: a mixed-ownership .old dir may resist rm -rf;
-        // that's harmless, the new version is already live.
-        const rmRes = await ssh.execCommand(`rm -rf "${trash}"`);
-        if (rmRes.stderr) console.error('❗ OLD-DIR CLEANUP STDERR:', rmRes.stderr);
+        // Cleanup of the swapped-out dir plus leftovers of earlier releases (<target>.old-<digits> only).
+        // A post-deploy step running as root (e.g. pip install -e writing *.egg-info) leaves root-owned files
+        // the deploy user cannot remove; then the same paths go once more through sudo, password on stdin
+        // (v0.6.2, TomicFundsBase 17.11.2026). Still best effort: the new version is already live.
+        const oldGlob = `"${remoteTargetDir}".old-[0-9]*`;
+        const rmRes = await ssh.execCommand(`rm -rf "${trash}" ${oldGlob} 2>/dev/null; ls -d ${oldGlob} 2>/dev/null`);
+        const left = rmRes.stdout.trim().split('\n').filter((p) => /\.old-\d+$/.test(p) && p.startsWith(`${remoteTargetDir}.old-`));
+        if (left.length) {
+          const pwd = process.env.SSH_SUDO_PASSWORD || process.env.SSH_PASSPHRASE || '';
+          const quoted = left.map((p) => `'${p.replace(/'/g, `'\\''`)}'`).join(' ');
+          const sudoRes = pwd
+            ? await ssh.execCommand(`sudo -S -p '' rm -rf ${quoted}; ls -d ${oldGlob} 2>/dev/null`, { stdin: `${pwd}\n` })
+            : { stdout: left.join('\n') };
+          const still = (sudoRes.stdout || '').trim();
+          if (still) console.error(`❗ OLD-DIR CLEANUP: could not remove ${still.split('\n').join(', ')}`);
+          else log(`🧹 Removed old dirs with sudo: ${left.join(', ')}`);
+        }
       } else {
         log(`📤 Uploading file ${item.path} → ${remoteTargetFile} ...`);
         await ssh.execCommand(`mkdir -p "${remoteTargetDir}"`);
