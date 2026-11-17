@@ -11,8 +11,8 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync } from 'child_process';
-import dotenv from 'dotenv';
-import { NodeSSH } from 'node-ssh';
+import { connectFromEnv } from '../core/ssh.js';
+import { compareVersions } from '../core/release-lock.js';
 import { pathToFileURL } from 'url';
 import loadProjectBootstrap from '../core/load-project-bootstrap.js';
 
@@ -29,31 +29,30 @@ export async function runDeploy(bootstrap) {
 
   const log = (...args) => { if (!flags.silent) console.log(...args); };
 
-  if (!target) {
-    console.error('❌ No target specified');
-    process.exit(1);
-  }
-
-  dotenv.config({ path: ENV_FILE });
-
-  const sshConfig = {
-    host: process.env.SSH_HOST,
-    username: process.env.SSH_USER,
-    privateKeyPath: process.env.SSH_KEY,
-    passphrase: process.env.SSH_PASSPHRASE,
-  };
-
-  if (!sshConfig.host || !sshConfig.username || !sshConfig.privateKeyPath) {
-    console.error('❌ Missing SSH env vars. Need SSH_HOST, SSH_USER, SSH_KEY (and optional SSH_PASSPHRASE).');
-    console.error(`   Expected in: ${ENV_FILE}`);
-    process.exit(1);
-  }
+  if (!target) throw new Error('No target specified');
 
   const remoteBase = `${REMOTE_BASE_PATH}${target}`;
 
   log(`🔐 Connecting to server (${target})...`);
-  const ssh = new NodeSSH();
-  await ssh.connect(sshConfig);
+  const ssh = await connectFromEnv(ENV_FILE);
+
+  // v0.6.0: never overwrite a newer version. Another agent may have released (or deployed by hand) in the meantime;
+  // its build.info / version.json on the server then carries a higher version than ours. RELEASE_FORCE=1 overrides.
+  const localVersion = bootstrap.packageJson?.version;
+  if (localVersion && process.env.RELEASE_FORCE !== '1') {
+    for (const item of DEPLOY_ITEMS.filter(i => i.isDir)) {
+      const dir = item.remoteSubdir ? `${remoteBase}/${item.remoteSubdir}` : remoteBase;
+      const r = await ssh.execCommand(`cat "${dir}/build.info" 2>/dev/null || cat "${dir}/version.json" 2>/dev/null`);
+      let remoteVersion = null;
+      try { remoteVersion = JSON.parse(r.stdout).version; } catch { /* nothing deployed yet or no version file */ }
+      if (remoteVersion && compareVersions(remoteVersion, localVersion) > 0) {
+        ssh.dispose();
+        throw new Error(`Server already runs ${remoteVersion} in ${dir}, newer than this release ${localVersion} — ` +
+          'someone else released in the meantime. Pull, rebase and release again (RELEASE_FORCE=1 overrides).');
+      }
+      if (remoteVersion) log(`🔎 Server ${dir}: ${remoteVersion} → ${localVersion}`);
+    }
+  }
 
   try {
     for (const item of DEPLOY_ITEMS) {
@@ -93,7 +92,7 @@ export async function runDeploy(bootstrap) {
         if (!permRes.stdout.includes('write-ok')) {
           console.error('❌ Parent dir not writable or remote tar missing.');
           if (permRes.stderr) console.error('   STDERR:', permRes.stderr);
-          process.exit(1);
+          throw new Error('Deploy step failed (see above).');
         }
 
         log(`📤 Uploading archive → ${remoteTar} ...`);
@@ -107,7 +106,7 @@ export async function runDeploy(bootstrap) {
         if (!unpackRes.stdout.includes('unpack-ok')) {
           console.error('❌ Remote unpack failed.');
           if (unpackRes.stderr) console.error('   STDERR:', unpackRes.stderr);
-          process.exit(1);
+          throw new Error('Deploy step failed (see above).');
         }
 
         // Runtime data (preserveSubdirs, e.g. uploads/) moves from the live
@@ -131,7 +130,7 @@ export async function runDeploy(bootstrap) {
         if (!swapRes.stdout.includes('swap-ok')) {
           console.error('❌ Swap failed — the previous version may still be live.');
           if (swapRes.stderr) console.error('   STDERR:', swapRes.stderr);
-          process.exit(1);
+          throw new Error('Deploy step failed (see above).');
         }
 
         // Best-effort cleanup: a mixed-ownership .old dir may resist rm -rf;

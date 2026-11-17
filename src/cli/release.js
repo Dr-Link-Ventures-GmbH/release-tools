@@ -22,6 +22,7 @@ import path from 'path';
 import readline from 'readline';
 import loadProjectBootstrap from '../core/load-project-bootstrap.js';
 import { runDeploy } from './deploy.js';
+import { acquireReleaseLock } from '../core/release-lock.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -112,7 +113,7 @@ function ensureCleanGit() {
   if (status) {
     console.error('❌ Working tree not clean:');
     console.error(status);
-    process.exit(1);
+    throw new Error('Working tree not clean — commit or move the changes first (another agent may be working here).');
   }
 }
 
@@ -139,6 +140,13 @@ async function main() {
   // 1. Prerequisites (.env.<target>, etc.)
   run(`node "${path.join(__dirname, 'check-prerequisites.js')}" ${target}`);
 
+  // 1b. Other agents: refuse a dirty checkout before touching anything, then take the server-side release lock
+  // (one release per project and target across all machines, v0.6.0). Everything from pull to push runs under it,
+  // so the pull sees the previous release's commit and tag.
+  if (!flags.noGit) ensureCleanGit();
+  const lock = await acquireReleaseLock(bootstrap);
+  try {
+
   // 2. Git: switch to release branch, pull, optional merge
   if (!flags.noGit) {
     run(`git checkout ${REPO_BRANCH}`);
@@ -161,8 +169,7 @@ async function main() {
 
     const currentBranch = out('git rev-parse --abbrev-ref HEAD');
     if (currentBranch !== REPO_BRANCH) {
-      console.error(`❌ Release must run on '${REPO_BRANCH}' (currently on '${currentBranch}').`);
-      process.exit(1);
+      throw new Error(`Release must run on '${REPO_BRANCH}' (currently on '${currentBranch}').`);
     }
   } else {
     console.log('⚠️  Git update skipped (--no-git)');
@@ -241,6 +248,12 @@ async function main() {
   }
 
   console.log(`✅ Release ${version} → ${target} completed.`);
+  } finally {
+    await lock.release();
+  }
 }
 
-await main();
+main().catch((err) => {
+  console.error("❌ Release failed:", err?.message ?? err);
+  process.exit(1);
+});
