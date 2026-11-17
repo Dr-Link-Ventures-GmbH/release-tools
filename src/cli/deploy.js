@@ -38,7 +38,9 @@ export async function runDeploy(bootstrap) {
 
   // v0.6.0: never overwrite a newer version. Another agent may have released (or deployed by hand) in the meantime;
   // its build.info / version.json on the server then carries a higher version than ours. RELEASE_FORCE=1 overrides.
-  const localVersion = bootstrap.packageJson?.version;
+  // read fresh: release.js bumps package.json after the bootstrap was loaded
+  let localVersion = bootstrap.packageJson?.version;
+  try { localVersion = JSON.parse(fs.readFileSync(bootstrap.PACKAGE_JSON_FILE, 'utf8')).version || localVersion; } catch { /* keep */ }
   if (localVersion && process.env.RELEASE_FORCE !== '1') {
     for (const item of DEPLOY_ITEMS.filter(i => i.isDir)) {
       const dir = item.remoteSubdir ? `${remoteBase}/${item.remoteSubdir}` : remoteBase;
