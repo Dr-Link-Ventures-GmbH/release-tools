@@ -157,10 +157,16 @@ async function drive(ssh, b, cloneDir, target) {
   while (tags.includes(version)) version = calverNext(version);
   const commits = state.commit && shTry(`git rev-list --count ${state.commit}..HEAD`, cloneDir);
   log(`🚂 Driving ${version} = ${tip.slice(0, 7)}${commits ? ` (${commits} commits since ${state.version})` : ''}`);
-  // only inside the clone, never committed: bundlers read the version from package.json
-  run(`npm version ${version} --no-git-tag-version --allow-same-version --ignore-scripts`, cloneDir);
-
+  let releaseCommit = tip;
   try {
+    // bundlers read the version from package.json; the project's "version" script runs too (e.g. pyproject.toml).
+    // The change becomes a release commit on top of the tip that only the TAG carries — never pushed to the branch,
+    // so it cannot collide with other agents. Builds from the committed tree (git archive HEAD) see it as well.
+    run(`npm version ${version} --no-git-tag-version --allow-same-version`, cloneDir);
+    if (sh('git status --porcelain --untracked-files=no', cloneDir)) {
+      run(`git commit -q -a --no-verify -m "release v${version}"`, cloneDir);
+      releaseCommit = sh('git rev-parse HEAD', cloneDir);
+    }
     let validation = null;
     const validateCmd = process.env.RELEASE_VALIDATE_CMD || b.VALIDATE_CMD;
     if (validateCmd) {
@@ -179,7 +185,7 @@ async function drive(ssh, b, cloneDir, target) {
   }
 
   // reserve the version before the deploy: a tag push never collides with other agents' pushes to the branch
-  run(`git tag v${version} ${tip}`, cloneDir);
+  run(`git tag v${version} ${releaseCommit}`, cloneDir);
   run(`git push -q origin refs/tags/v${version}`, cloneDir);
 
   await runDeploy({ ...b, packageJson: { ...pkg, version } });
