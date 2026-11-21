@@ -234,7 +234,19 @@ async function main() {
 
   // 7. Push commits + tags
   if (!flags.noGit) {
-    run(`git push origin ${REPO_BRANCH} --tags`);
+    // v0.6.3: another agent may have pushed to the branch while this release built and deployed (plain commits
+    // need no lock). The release's own commit is only the version bump, so it is rebased onto the new tip and
+    // pushed again instead of failing after a successful deploy (TomicFunds 20./21.11.2026, twice).
+    for (let attempt = 1; ; attempt++) {
+      try {
+        run(`git push origin ${REPO_BRANCH} --tags`);
+        break;
+      } catch (err) {
+        if (attempt >= 3) throw err;
+        console.log(`↻ Push rejected (attempt ${attempt}) — rebasing the version commit onto origin/${REPO_BRANCH} and retrying`);
+        run(`git pull --rebase origin ${REPO_BRANCH}`);
+      }
+    }
 
     const branch = resolveBranchArg(args);
     if (branch && branch !== 'none') {
