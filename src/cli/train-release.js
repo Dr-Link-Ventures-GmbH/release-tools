@@ -45,6 +45,11 @@ const run = (cmd, cwd, env) => execSync(cmd, { cwd, stdio: ['ignore', 'inherit',
 const t = () => new Date().toLocaleTimeString('de-DE');
 const log = (...a) => console.log(`[${t()}]`, ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function retry(fn, what, n = 4) {
+  for (let i = 1; ; i++) {
+    try { return fn(); } catch (e) { if (i >= n) throw e; log(`↻ ${what} failed (attempt ${i}) — retrying`); await sleep(3000 * i); }
+  }
+}
 
 function calverNext(max) {
   const now = new Date();
@@ -211,7 +216,8 @@ async function main() {
 
   // which commit do we wait for?
   const gitDir = inClone ? cloneDir : agentDir;   // the clone belongs to the driver; read-only use here
-  if (!inClone) run(`git fetch -q origin ${branch}`, agentDir);
+  // worktrees share one repository with the release clone's driver: a concurrent fetch can hit a ref lock — retry
+  if (!inClone) await retry(() => run(`git fetch -q origin ${branch}`, agentDir), 'fetch');
   let want = opt('sha') ? sh(`git rev-parse ${opt('sha')}`, gitDir) : null;
   if (!want && (flag('latest') || inClone)) want = sh(`git ls-remote origin refs/heads/${branch}`, gitDir).split(/\s/)[0];
   if (!want) {
@@ -223,6 +229,8 @@ async function main() {
         try {
           try { run(`git pull -q --rebase origin ${branch}`, agentDir); }
           catch (e) {
+            const midRebase = ['rebase-merge', 'rebase-apply'].some((d) => fs.existsSync(path.resolve(agentDir, sh(`git rev-parse --git-path ${d}`, agentDir))));
+            if (!midRebase) throw e;   // fetch/ref-lock trouble, not a conflict → retried below
             shTry('git rebase --abort', agentDir);
             throw Object.assign(new Error(`Rebase onto origin/${branch} has conflicts — resolve them in ${agentDir}, commit, then run again.`), { fatal: true });
           }
