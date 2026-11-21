@@ -138,12 +138,15 @@ async function writeState(ssh, b, target, patch) {
 }
 
 /** Driver: build the current tip in the release clone and deploy it. Runs only while holding the lock. */
-async function drive(ssh, b, cloneDir, target) {
+async function drive(ssh, b0, cloneDir, target) {
+  let b = b0;
   const branch = b.REPO_BRANCH;
   run('git fetch origin --tags --force --prune --quiet', cloneDir);
   run(`git checkout -q -f ${branch}`, cloneDir);
   run(`git reset -q --hard origin/${branch}`, cloneDir);
   const tip = sh('git rev-parse HEAD', cloneDir);
+  // the project bootstrap may have changed with the commits just pulled (deploy items, secrets): load it fresh
+  b = { ...(await loadBootstrap(cloneDir)), target };
 
   const state = await readState(ssh, b, target);
   if (state.commit && isAncestor(tip, state.commit, cloneDir)) { log(`✅ ${tip.slice(0, 7)} is already live (${state.version}).`); return; }
