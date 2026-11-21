@@ -101,7 +101,15 @@ async function loadBootstrap(cloneDir) {
   process.chdir(cloneDir);
   const p = path.join(cloneDir, 'scripts', 'bootstrap.js');
   if (!fs.existsSync(p)) throw new Error(`Project bootstrap not found: ${p}`);
-  return (await import(pathToFileURL(p).href)).default;
+  // a driver may be reinstalling node_modules in the clone right now (lockfile changed): wait and retry
+  for (let i = 1; ; i++) {
+    try { return await (await import(`${pathToFileURL(p).href}?t=${Date.now()}`)).default; }
+    catch (e) {
+      if (i >= 20 || !/Cannot find (module|package)/.test(String(e?.message))) throw e;
+      if (i === 1) log('⏳ Release clone is reinstalling its dependencies — waiting…');
+      await sleep(15_000);
+    }
+  }
 }
 
 const statePath = (b, target) => `${b.REMOTE_BASE_PATH.replace(/\/+$/, '')}/.release-state-${target}.json`;
@@ -149,8 +157,9 @@ async function drive(ssh, b, cloneDir, target) {
   const stamp = path.join(cloneDir, 'node_modules', '.release-train-lock');
   const have = fs.existsSync(stamp) ? fs.readFileSync(stamp, 'utf8').trim() : '';
   if (want !== have) {
-    log('📦 Lockfile changed — npm ci');
-    run(lockFile ? 'npm ci --no-audit --no-fund' : 'npm install --no-audit --no-fund', cloneDir);
+    log('📦 Lockfile changed — npm install');
+    // npm install, not npm ci: ci wipes node_modules first, and riders load the project bootstrap from there
+    run('npm install --no-audit --no-fund', cloneDir);
     fs.writeFileSync(stamp, want);
   }
 
