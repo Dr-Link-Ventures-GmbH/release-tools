@@ -245,6 +245,12 @@ async function main() {
         if (attempt >= 3) throw err;
         console.log(`↻ Push rejected (attempt ${attempt}) — rebasing the version commit onto origin/${REPO_BRANCH} and retrying`);
         run(`git pull --rebase origin ${REPO_BRANCH}`);
+        // the tag npm version set still points at the pre-rebase commit (and may already be on the remote):
+        // move it to the rebased commit and replace the remote copy, so the tag sits on the branch
+        if (bump !== 'none') {
+          run(`git tag -f v${version}`);
+          run(`git push -f origin refs/tags/v${version}`);
+        }
       }
     }
 
