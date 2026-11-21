@@ -158,6 +158,8 @@ async function drive(ssh, b, cloneDir, target) {
   const commits = state.commit && shTry(`git rev-list --count ${state.commit}..HEAD`, cloneDir);
   log(`🚂 Driving ${version} = ${tip.slice(0, 7)}${commits ? ` (${commits} commits since ${state.version})` : ''}`);
   let releaseCommit = tip;
+  // last live commit for diff-scoped validation (release tags sit on side commits, `git describe` can't see them)
+  const prevEnv = state.commit ? { RELEASE_PREV_COMMIT: String(state.commit) } : {};
   try {
     // bundlers read the version from package.json; the project's "version" script runs too (e.g. pyproject.toml).
     // The change becomes a release commit on top of the tip that only the TAG carries — never pushed to the branch,
@@ -171,11 +173,11 @@ async function drive(ssh, b, cloneDir, target) {
     const validateCmd = process.env.RELEASE_VALIDATE_CMD || b.VALIDATE_CMD;
     if (validateCmd) {
       log(`🧪 Validation in parallel: ${validateCmd}`);
-      validation = new Promise((res, rej) => spawn(validateCmd, { cwd: cloneDir, shell: true, stdio: ['ignore', 'inherit', 'inherit'] })
+      validation = new Promise((res, rej) => spawn(validateCmd, { cwd: cloneDir, shell: true, stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, ...prevEnv } })
         .on('close', (c) => (c === 0 ? res() : rej(new Error(`Validation failed (${validateCmd}, exit ${c})`)))));
       validation.catch(() => {});
     }
-    run('npm run build', cloneDir, { BUILD_TARGET: target });
+    run('npm run build', cloneDir, { BUILD_TARGET: target, ...prevEnv });
     if (validation) await validation;
     const here = path.dirname(fileURLToPath(import.meta.url));
     run(`node "${path.join(here, 'write-version-info.js')}"`, cloneDir, { VERSION: version, DIST_DIR: b.DIST_DIR });
@@ -186,7 +188,7 @@ async function drive(ssh, b, cloneDir, target) {
 
   // reserve the version before the deploy: a tag push never collides with other agents' pushes to the branch
   run(`git tag v${version} ${releaseCommit}`, cloneDir);
-  run(`git push -q origin refs/tags/v${version}`, cloneDir);
+  run(`git push -q --no-verify origin refs/tags/v${version}`, cloneDir);   // validated above, skip pre-push hooks
 
   await runDeploy({ ...b, packageJson: { ...pkg, version } });
   await writeState(ssh, b, target, { commit: tip, version, deployedAt: new Date().toISOString(), host: os.hostname(), failed: null });
@@ -218,8 +220,16 @@ async function main() {
       if (!flag('push')) throw new Error(`HEAD ${want.slice(0, 7)} is not on origin/${branch} — push it first (or call with --push).`);
       if (sh('git status --porcelain --untracked-files=no', agentDir)) throw new Error('Uncommitted changes — commit first.');
       for (let i = 1; ; i++) {
-        try { run(`git pull -q --rebase origin ${branch}`, agentDir); run(`git push -q origin HEAD:${branch}`, agentDir); break; }
-        catch (e) { if (i >= 3) throw e; log(`↻ Push rejected (attempt ${i}) — retrying`); }
+        try {
+          try { run(`git pull -q --rebase origin ${branch}`, agentDir); }
+          catch (e) {
+            shTry('git rebase --abort', agentDir);
+            throw Object.assign(new Error(`Rebase onto origin/${branch} has conflicts — resolve them in ${agentDir}, commit, then run again.`), { fatal: true });
+          }
+          run(`git push -q origin HEAD:${branch}`, agentDir);
+          break;
+        }
+        catch (e) { if (e.fatal || i >= 3) throw e; log(`↻ Push rejected (attempt ${i}) — retrying`); }
       }
       want = sh('git rev-parse HEAD', agentDir);
       log(`⬆️  Pushed ${want.slice(0, 7)} to origin/${branch}`);
