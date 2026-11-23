@@ -45,6 +45,13 @@ import { pathToFileURL, fileURLToPath } from 'url';
 import { connectFromEnv } from '../core/ssh.js';
 import { tryAcquireReleaseLock, compareVersions, q } from '../core/release-lock.js';
 import { runDeploy } from './deploy.js';
+import { notify } from '../core/notify.js';
+
+/** "TomicFundsApp production" — the repo name from origin, for messages */
+function label(cloneDir, target) {
+  const url = shTry('git config --get remote.origin.url', cloneDir) || cloneDir;
+  return `*${path.basename(url).replace(/\.git$/, '')}* ${target}`;
+}
 
 const POLL_MS = Number(process.env.RELEASE_TRAIN_POLL_MS || 10_000);
 const args = process.argv.slice(2);
@@ -246,6 +253,7 @@ async function drive(ssh, b0, cloneDir, target) {
     run(`node "${path.join(here, 'write-version-info.js')}"`, cloneDir, { VERSION: version, DIST_DIR: b.DIST_DIR });
   } catch (e) {
     await writeState(ssh, b, target, { failed: { commit: tip, version, host: os.hostname(), at: new Date().toISOString(), error: String(e.message).slice(0, 300) } });
+    await notify(`🔴 ${label(cloneDir, target)}: Build von main \`${tip.slice(0, 7)}\` fehlgeschlagen (${os.hostname()}).\n> ${String(e.message).slice(0, 300)}\nMitfahrer stoppen, bis ein Fix gepusht ist; live bleibt ${state.version || 'der bisherige Stand'}.`);
     throw e;
   }
 
@@ -253,8 +261,13 @@ async function drive(ssh, b0, cloneDir, target) {
   run(`git tag v${version} ${releaseCommit}`, cloneDir);
   run(`git push -q --no-verify origin refs/tags/v${version}`, cloneDir);   // validated above, skip pre-push hooks
 
-  await runDeploy({ ...b, viaTrain: true, packageJson: { ...pkg, version } });
+  try { await runDeploy({ ...b, viaTrain: true, packageJson: { ...pkg, version } }); }
+  catch (e) {
+    await notify(`🔴 ${label(cloneDir, target)}: Deploy von ${version} (\`${tip.slice(0, 7)}\`) fehlgeschlagen (${os.hostname()}).\n> ${String(e.message).slice(0, 300)}\nDer nächste Release-Aufruf versucht es erneut.`);
+    throw e;
+  }
   await writeState(ssh, b, target, { commit: tip, version, deployedAt: new Date().toISOString(), host: os.hostname(), failed: null });
+  if (state.failed) await notify(`🟢 ${label(cloneDir, target)}: wieder grün — ${version} (\`${tip.slice(0, 7)}\`) ist live.`);
   log(`🚀 ${version} (${tip.slice(0, 7)}) is live on ${target}.`);
 }
 
@@ -414,6 +427,7 @@ async function rollback(callerDir, target, toVersion) {
                 error: `rolled back to v${backTo} by ${by} — push a fix, then release again` },
     });
     log(`⏪ ${version} (= content of v${backTo}) is live on ${target}. main stays blocked at ${badTip.slice(0, 7)} until the next push.`);
+    await notify(`⏪ ${label(cloneDir, target)}: Rollback von ${state.version} auf den Stand von v${backTo} (live als ${version}) durch ${by}.\nmain bleibt bei \`${badTip.slice(0, 7)}\` gesperrt, bis ein Fix gepusht ist.`);
   } finally { await lock.release(); }
 }
 

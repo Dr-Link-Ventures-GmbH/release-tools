@@ -19,6 +19,7 @@
 //   8. --rollback puts the previous content back live under a new version and blocks the bad tip (0.8.2)
 // Everything is removed afterwards (temp dir, remote dir) unless KEEP=1.
 import { execSync, spawn } from 'node:child_process';
+import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -38,6 +39,15 @@ const fwd = (p) => p.replaceAll('\\', '/');
 
 const sh = (cmd, cwd) => execSync(cmd, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// local stand-in for slack.com/api: every chat.postMessage of the train lands here (never real Slack)
+const slackMessages = [];
+const slackMock = http.createServer((req, res) => {
+  let body = '';
+  req.on('data', (d) => { body += d; });
+  req.on('end', () => { try { slackMessages.push(JSON.parse(body).text); } catch { /* ignore */ } res.setHeader('Content-Type', 'application/json'); res.end('{"ok":true}'); });
+});
+await new Promise((r) => slackMock.listen(0, '127.0.0.1', r));
+const SLACK_ENV = { RELEASE_SLACK_API: `http://127.0.0.1:${slackMock.address().port}`, RELEASE_SLACK_TOKEN: 'xoxb-test', RELEASE_SLACK_CHANNEL: 'CTEST' };
 let failures = 0;
 let lastOut = '';   // output of the last finished train run, printed when a check fails
 function check(ok, what) {
@@ -54,7 +64,7 @@ async function remote(cmd) {
 function train(cwd, args, env = {}) {
   let out = '';
   const child = spawn(process.execPath, [TRAIN, 'test', ...args], {
-    cwd, env: { ...process.env, RELEASE_TRAIN_POLL_MS: '2000', RELEASE_CLONE_DIR: fwd(path.join(TMP, '_release', 'proj')), ...env },
+    cwd, env: { ...process.env, ...SLACK_ENV, RELEASE_TRAIN_POLL_MS: '2000', RELEASE_CLONE_DIR: fwd(path.join(TMP, '_release', 'proj')), ...env },
   });
   child.stdout.on('data', (d) => { out += d; });
   child.stderr.on('data', (d) => { out += d; });
@@ -177,6 +187,8 @@ async function scenarioBrokenBuild() {
   removeAndCommit(dir, 'FAIL_BUILD', 'fix the build');
   const third = await train(dir, ['--push']).done;
   check(third.code === 0, 'nach dem Fix wieder live');
+  check(slackMessages.some((m) => m.startsWith('🔴') && /Build von main/.test(m)), 'Slack-Meldung 🔴 zum kaputten Build');
+  check(slackMessages.some((m) => m.startsWith('🟢')), 'Slack-Meldung 🟢 wieder grün');
 }
 
 async function scenarioConflict() {
@@ -262,6 +274,7 @@ async function scenarioRollback() {
   check(!(await files()).includes('bad.txt'), 'bad.txt ist nicht mehr live');
   check(compareVersions(after.version, bad.version) > 0 && after.rolledBack?.from === bad.version,
     `neue Versionsnummer ${after.version} > ${bad.version}, Rollback auf ${after.rolledBack?.to}`);
+  check(slackMessages.some((m) => m.startsWith('⏪') && /Rollback/.test(m)), 'Slack-Meldung ⏪ zum Rollback');
   const rider = await train(dir, ['--latest']).done;
   check(rider.code !== 0 && /rolled back/.test(rider.out) && !/🚂 Driving/.test(rider.out), 'Mitfahrer liefert den zurückgerollten Stand nicht erneut aus');
   removeAndCommit(dir, 'bad.txt', 'fix: drop bad change');
@@ -313,6 +326,7 @@ async function main() {
     }
   }
   console.log(`\n${failures ? `❌ ${failures} Prüfung(en) fehlgeschlagen` : '✅ alle Prüfungen grün'} (${Math.round((Date.now() - t0) / 1000)} s)`);
+  slackMock.close();
   process.exit(failures ? 1 : 0);
 }
 
