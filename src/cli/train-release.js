@@ -75,14 +75,38 @@ function cloneDirFor(agentDir) {
   return path.join(path.dirname(mainCheckout), '_release', repo);
 }
 
+/** Local config the repo does not carry: .env* and every other git-ignored FILE in the project root
+ *  (e.g. .google-service-account.json, which BetaOSBase's preinstall check requires) — never directories.
+ *  Runs on every call and only fills in what is missing, so an interrupted first setup heals itself. */
+function copyLocalConfig(cloneDir, agentDir) {
+  const mainCheckout = path.dirname(path.resolve(agentDir, sh('git rev-parse --git-common-dir', agentDir)));
+  for (const src of [...new Set([agentDir, mainCheckout])]) {
+    if (path.resolve(src) === path.resolve(cloneDir)) continue;
+    const ignored = (shTry('git ls-files --others --ignored --exclude-standard --directory', src) || '').split(/\r?\n/)
+      .map((n) => n.trim()).filter((n) => n && !n.includes('/'));
+    const names = new Set([...fs.readdirSync(src).filter((n) => n.startsWith('.env')), ...ignored]);
+    for (const n of names) {
+      if (n === '.env.example') continue;
+      const from = path.join(src, n);
+      let st; try { st = fs.statSync(from); } catch { continue; }
+      if (!st.isFile() || st.size > 1_000_000) continue;
+      if (!fs.existsSync(path.join(cloneDir, n))) { fs.copyFileSync(from, path.join(cloneDir, n)); log(`📄 copied ${n} into the release clone`); }
+    }
+  }
+}
+
 async function ensureClone(cloneDir, agentDir) {
-  // ready = cloned AND dependencies installed (the project bootstrap imports release-tools from node_modules)
-  if (fs.existsSync(path.join(cloneDir, '.git')) && fs.existsSync(path.join(cloneDir, 'node_modules'))) return;
+  // ready = cloned AND one successful dependency install (stamp written afterwards) — a half-finished
+  // node_modules from an interrupted first install does not count
+  const stamp = path.join(cloneDir, 'node_modules', '.release-train-lock');
+  const ready = () => fs.existsSync(path.join(cloneDir, '.git')) && fs.existsSync(stamp);
+  if (fs.existsSync(path.join(cloneDir, '.git'))) copyLocalConfig(cloneDir, agentDir);
+  if (ready()) return;
   const busy = `${cloneDir}.creating`;
   fs.mkdirSync(path.dirname(cloneDir), { recursive: true });
   try { fs.mkdirSync(busy); } catch {
-    log(`⏳ Release clone ${cloneDir} is being created by another agent — waiting…`);
-    while (!fs.existsSync(path.join(cloneDir, 'node_modules')) && fs.existsSync(busy)) await sleep(5000);
+    log(`⏳ Release clone ${cloneDir} is being set up by another agent — waiting…`);
+    while (!ready() && fs.existsSync(busy)) await sleep(5000);
     return;
   }
   try {
@@ -91,25 +115,11 @@ async function ensureClone(cloneDir, agentDir) {
       log(`📥 Creating release clone ${cloneDir}`);
       run(`git clone "${url}" "${cloneDir}"`, path.dirname(cloneDir));
     }
-    const mainCheckout = path.dirname(path.resolve(agentDir, sh('git rev-parse --git-common-dir', agentDir)));
-    // local config the repo does not carry: .env* and every other git-ignored FILE in the project root
-    // (e.g. .google-service-account.json, which BetaOSBase's preinstall check requires) — never directories
-    for (const src of [agentDir, mainCheckout]) {
-      const ignored = (shTry('git ls-files --others --ignored --exclude-standard --directory', src) || '').split(/\r?\n/)
-        .map((n) => n.trim()).filter((n) => n && !n.includes('/'));
-      const names = new Set([...fs.readdirSync(src).filter((n) => n.startsWith('.env')), ...ignored]);
-      for (const n of names) {
-        if (n === '.env.example') continue;
-        const from = path.join(src, n);
-        let st; try { st = fs.statSync(from); } catch { continue; }
-        if (!st.isFile() || st.size > 1_000_000) continue;
-        if (!fs.existsSync(path.join(cloneDir, n))) { fs.copyFileSync(from, path.join(cloneDir, n)); log(`📄 copied ${n} into the release clone`); }
-      }
-    }
+    copyLocalConfig(cloneDir, agentDir);
     log('📦 Installing dependencies in the release clone');
     run('npm install --no-audit --no-fund', cloneDir);
     const lockFile = path.join(cloneDir, 'package-lock.json');
-    if (fs.existsSync(lockFile)) fs.writeFileSync(path.join(cloneDir, 'node_modules', '.release-train-lock'), sh(`git hash-object "${lockFile}"`, cloneDir));
+    fs.writeFileSync(stamp, fs.existsSync(lockFile) ? sh(`git hash-object "${lockFile}"`, cloneDir) : 'none');
   } finally { fs.rmSync(busy, { recursive: true, force: true }); }
 }
 
