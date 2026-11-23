@@ -16,7 +16,13 @@
 //   - A failed build of tip X is recorded; the other waiters stop instead of rebuilding the same broken X. The next
 //     push (new tip) gets a fresh try.
 //
-// CLI: release-train <target> [--push] [--sha=<commit>] [--latest]
+// CLI: release-train <target> [<branch>] [--branch=<name>] [--push] [--sha=<commit>] [--latest]
+//   <branch> / --branch  release that branch: it is rebased onto origin/<main> IN ITS OWN WORKTREE (a temporary
+//             detached one if it has none locally, e.g. pushed from the NUC) and pushed as main (implies --push).
+//             Replaces the per-project release-locked.mjs wrappers (NAKPortal, NAKBase) since v0.8.1.
+// package.json "releaseTrain" (optional, read from the caller's checkout before anything else):
+//   { "clone": "main-checkout" | "<path>",   release clone = the repo's main checkout (NAKPortal, NAKBase)
+//     "env": { "NODE_OPTIONS": "…" } }       env defaults for build/validation
 //   --push    HEAD not on origin yet: rebase onto origin/<branch> and push HEAD:<branch> (3 attempts)
 //   --sha     wait for this commit instead of HEAD
 //   --latest  release whatever origin/<branch> is now (default when run inside the release clone)
@@ -64,10 +70,17 @@ function isAncestor(sha, of, cwd) {
 }
 
 /** Resolve the release clone: projects/_release/<repo>, next to the main checkout's parent. */
+function trainConfig(dir) {
+  try { return JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).releaseTrain || {}; } catch { return {}; }
+}
+
 function cloneDirFor(agentDir) {
   if (process.env.RELEASE_CLONE_DIR) return path.resolve(process.env.RELEASE_CLONE_DIR);
   const common = path.resolve(agentDir, sh('git rev-parse --git-common-dir', agentDir));
   const mainCheckout = path.dirname(common);
+  const cfg = trainConfig(agentDir).clone;
+  if (cfg === 'main-checkout') return mainCheckout;
+  if (cfg) return path.resolve(mainCheckout, cfg);
   const url = sh('git config --get remote.origin.url', agentDir);
   const repo = path.basename(url).replace(/\.git$/, '');
   // agent already sits inside a release clone (…/_release/<repo>)
@@ -238,11 +251,7 @@ async function drive(ssh, b0, cloneDir, target) {
   log(`🚀 ${version} (${tip.slice(0, 7)}) is live on ${target}.`);
 }
 
-async function main() {
-  const agentDir = process.cwd();
-  const target = args.find((a) => !a.startsWith('--'));
-  if (!target) throw new Error('Usage: release-train <target> [--push] [--sha=<commit>] [--latest]');
-
+async function runTrain(agentDir, target, forcePush) {
   const cloneDir = cloneDirFor(agentDir);
   const inClone = path.resolve(agentDir) === path.resolve(cloneDir);
   await ensureClone(cloneDir, agentDir);
@@ -261,7 +270,7 @@ async function main() {
   if (!want) {
     want = sh('git rev-parse HEAD', agentDir);
     if (!isAncestor(want, `origin/${branch}`, agentDir)) {
-      if (!flag('push')) throw new Error(`HEAD ${want.slice(0, 7)} is not on origin/${branch} — push it first (or call with --push).`);
+      if (!forcePush && !flag('push')) throw new Error(`HEAD ${want.slice(0, 7)} is not on origin/${branch} — push it first (or call with --push).`);
       if (sh('git status --porcelain --untracked-files=no', agentDir)) throw new Error('Uncommitted changes — commit first.');
       for (let i = 1; ; i++) {
         try {
@@ -275,7 +284,12 @@ async function main() {
           run(`git push -q origin HEAD:${branch}`, agentDir);
           break;
         }
-        catch (e) { if (e.fatal || i >= 3) throw e; log(`↻ Push rejected (attempt ${i}) — retrying`); }
+        catch (e) {
+          // v0.8.1: with many agents a push can lose several races in a row — 8 tries, random backoff
+          if (e.fatal || i >= 8) throw e;
+          log(`↻ Push rejected (attempt ${i}) — retrying`);
+          await sleep(500 + Math.random() * 1500 * i);
+        }
       }
       want = sh('git rev-parse HEAD', agentDir);
       log(`⬆️  Pushed ${want.slice(0, 7)} to origin/${branch}`);
@@ -288,6 +302,7 @@ async function main() {
   const start = Date.now();
   const ssh = await connectFromEnv(b.ENV_FILE);
   let lastHeld = '';
+  let lockSsh = null;   // one connection for all lock attempts of this waiter (was: a new one every poll)
   try {
     for (;;) {
       const state = await readState(ssh, b, target);
@@ -306,19 +321,57 @@ async function main() {
         throw new Error(`Build of ${state.failed.commit.slice(0, 7)} (contains your commit) failed on ${state.failed.host}: ${state.failed.error}`);
       }
 
-      const lockSsh = await connectFromEnv(b.ENV_FILE);
+      lockSsh ||= await connectFromEnv(b.ENV_FILE);
       const r = await tryAcquireReleaseLock(lockSsh, { REMOTE_BASE_PATH: b.REMOTE_BASE_PATH, target, log });
       if (r.lock) {
-        try { await drive(lockSsh, b, cloneDir, target); }
+        const owned = lockSsh; lockSsh = null;   // the lock owns (and disposes) this connection now
+        try { await drive(owned, b, cloneDir, target); }
         finally { await r.lock.release(); }
         continue;   // re-check: our commit is normally part of what we just built
       }
-      lockSsh.dispose();
       if (Date.now() - start > maxWait) throw new Error(`Timed out waiting for the release train (held by ${r.held}).`);
       if (r.held !== lastHeld) { log(`⏳ Train is running (${r.held}, ${r.age}s) — your commit rides along or goes with the next one.`); lastHeld = r.held; }
       await sleep(POLL_MS);
     }
-  } finally { ssh.dispose(); }
+  } finally { ssh.dispose(); lockSsh?.dispose(); }
+}
+
+function worktreeOf(repoDir, name) {
+  for (const block of sh('git worktree list --porcelain', repoDir).split(/\n\s*\n/)) {
+    const wt = (block.match(/^worktree (.+)$/m) || [])[1];
+    const br = (block.match(/^branch refs\/heads\/(.+)$/m) || [])[1];
+    if (wt && br === name) return path.resolve(wt);
+  }
+  return null;
+}
+
+async function main() {
+  const positionals = args.filter((a) => !a.startsWith('--'));
+  const target = positionals[0];
+  const branchArg = opt('branch') || positionals[1] || null;
+  if (!target) throw new Error('Usage: release-train <target> [<branch>] [--push] [--sha=<commit>] [--latest]');
+  const callerDir = process.cwd();
+  for (const [k, v] of Object.entries(trainConfig(callerDir).env || {})) {
+    if (k === 'NODE_OPTIONS') process.env[k] = [process.env[k], v].filter(Boolean).join(' ');
+    else if (process.env[k] === undefined) process.env[k] = String(v);
+  }
+  if (!branchArg) return runTrain(callerDir, target, false);
+
+  // the branch's own worktree, or a temporary detached one of the local branch / origin branch
+  let agentDir = worktreeOf(callerDir, branchArg);
+  let tmp = null;
+  if (!agentDir) {
+    await retry(() => run('git fetch -q origin', callerDir), 'fetch');
+    const ref = shTry(`git rev-parse --verify -q refs/heads/${branchArg}`, callerDir) ? branchArg : `origin/${branchArg}`;
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'release-train-'));
+    run(`git worktree add -q --detach "${tmp}" ${ref}`, callerDir);
+    agentDir = tmp;
+    log(`🌿 ${branchArg} has no local worktree — using a temporary one (${ref})`);
+  } else {
+    log(`🌿 Releasing ${branchArg} from its worktree ${agentDir}`);
+  }
+  try { return await runTrain(agentDir, target, true); }
+  finally { if (tmp) { shTry(`git worktree remove --force "${tmp}"`, callerDir); fs.rmSync(tmp, { recursive: true, force: true }); } }
 }
 
 main().then(() => process.exit(0)).catch((err) => {

@@ -143,8 +143,8 @@ async function scenarioKilledDriver() {
   for (let i = 0; i < 120 && !/🚂 Driving/.test(run.out); i++) await sleep(1000);
   check(/🚂 Driving/.test(run.out), 'langsamer Build läuft');
   // kill the whole tree (the build is a grandchild): a dead agent, as after a tool timeout
-  if (process.platform === 'win32') execSync(`taskkill /F /T /PID ${run.child.pid}`, { stdio: 'ignore' });
-  else run.child.kill('SIGKILL');
+  try { if (process.platform === 'win32') execSync(`taskkill /F /T /PID ${run.child.pid}`, { stdio: 'ignore' }); } catch { /* tree partly gone already */ }
+  if (process.platform !== 'win32') run.child.kill('SIGKILL');
   await run.done;
   removeAndCommit(dir, 'SLOW_BUILD', 'fast again');
   const t0 = Date.now();
@@ -208,6 +208,33 @@ async function scenarioLegacyRefused() {
   check(sh('git rev-parse main', path.join(TMP, 'origin.git')) === before, 'main unverändert');
 }
 
+async function scenarioBranch() {
+  console.log('\n7. Release per Branch-Name (ersetzt die Wrapper von NAKPortal/NAKBase)');
+  const main = path.join(TMP, 'main');
+  const origin = path.join(TMP, 'origin.git');
+  const live = async () => JSON.parse((await remote(`cat ${REMOTE}/.release-state-test.json`)) || '{}').commit;
+  const onMainLive = async (subject) => {
+    const sha = sh(`git log main --format=%H --grep="^${subject}$"`, origin).split('\n')[0];
+    return !!sha && sh(`git merge-base --is-ancestor ${sha} ${await live()} && echo yes || echo no`, origin) === 'yes';
+  };
+  // a) branch with its own worktree, called from the main checkout as `release:prod -- agent/b7`
+  const b7 = agent('b7');
+  commit(b7, 'b7.txt', '7\n', 'b7 feature');
+  const r1 = await train(main, ['agent/b7']).done;
+  check(r1.code === 0 && /from its worktree/.test(r1.out), 'Branch mit Worktree released');
+  if (r1.code !== 0) console.log(r1.out.slice(-1200));
+  check(await onMainLive('b7 feature'), 'Commit von agent/b7 ist live');
+  // b) branch only on origin (pushed from another machine), no local worktree, no local branch
+  const b8 = agent('b8');
+  commit(b8, 'b8.txt', '8\n', 'b8 feature');
+  sh('git push -q origin agent/b8', b8);
+  sh(`git worktree remove --force "${fwd(b8)}" && git branch -D -q agent/b8`, main);
+  const r2 = await train(main, ['--branch=agent/b8']).done;
+  check(r2.code === 0 && /temporary one/.test(r2.out), 'Branch nur auf origin released (temporärer Worktree)');
+  check(await onMainLive('b8 feature'), 'Commit von agent/b8 ist live');
+  check(!/release-train-/.test(sh('git worktree list', main)), 'temporärer Worktree wieder entfernt');
+}
+
 async function main() {
   const t0 = Date.now();
   try {
@@ -221,6 +248,7 @@ async function main() {
     if (want(4)) await scenarioConflict();
     if (want(5)) await scenarioBootstrapChange();
     if (want(6)) await scenarioLegacyRefused();
+    if (want(7)) await scenarioBranch();
   } finally {
     if (process.env.KEEP !== '1') {
       await remote(`rm -rf ${REMOTE}`).catch(() => {});

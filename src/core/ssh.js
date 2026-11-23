@@ -16,5 +16,20 @@ export async function connectFromEnv(envFile) {
   }
   const ssh = new NodeSSH();
   await ssh.connect(cfg);
+  // v0.8.1: alpha sporadically refuses a channel when many releases run at once ("Channel open failure",
+  // 23.11.2026: 13 parallel releases, and in the e2e test). A command never started on the server, so it is
+  // safe to retry — with backoff, on the same connection.
+  for (const fn of ['execCommand', 'putFile']) {
+    const orig = ssh[fn].bind(ssh);
+    ssh[fn] = async (...a) => {
+      for (let i = 1; ; i++) {
+        try { return await orig(...a); }
+        catch (e) {
+          if (i >= 6 || !/Channel open failure|open failed/i.test(String(e?.message))) throw e;
+          await new Promise((r) => setTimeout(r, 500 * i * i));
+        }
+      }
+    };
+  }
   return ssh;
 }
