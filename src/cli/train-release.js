@@ -76,7 +76,8 @@ function cloneDirFor(agentDir) {
 }
 
 async function ensureClone(cloneDir, agentDir) {
-  if (fs.existsSync(path.join(cloneDir, '.git'))) return;
+  // ready = cloned AND dependencies installed (the project bootstrap imports release-tools from node_modules)
+  if (fs.existsSync(path.join(cloneDir, '.git')) && fs.existsSync(path.join(cloneDir, 'node_modules'))) return;
   const busy = `${cloneDir}.creating`;
   fs.mkdirSync(path.dirname(cloneDir), { recursive: true });
   try { fs.mkdirSync(busy); } catch {
@@ -85,15 +86,21 @@ async function ensureClone(cloneDir, agentDir) {
     return;
   }
   try {
-    const url = sh('git config --get remote.origin.url', agentDir);
-    log(`📥 Creating release clone ${cloneDir}`);
-    run(`git clone "${url}" "${cloneDir}"`, path.dirname(cloneDir));
+    if (!fs.existsSync(path.join(cloneDir, '.git'))) {
+      const url = sh('git config --get remote.origin.url', agentDir);
+      log(`📥 Creating release clone ${cloneDir}`);
+      run(`git clone "${url}" "${cloneDir}"`, path.dirname(cloneDir));
+    }
     const mainCheckout = path.dirname(path.resolve(agentDir, sh('git rev-parse --git-common-dir', agentDir)));
     for (const src of [agentDir, mainCheckout]) {
       for (const f of fs.readdirSync(src).filter((n) => n.startsWith('.env') && n !== '.env.example')) {
         if (!fs.existsSync(path.join(cloneDir, f))) fs.copyFileSync(path.join(src, f), path.join(cloneDir, f));
       }
     }
+    log('📦 Installing dependencies in the release clone');
+    run('npm install --no-audit --no-fund', cloneDir);
+    const lockFile = path.join(cloneDir, 'package-lock.json');
+    if (fs.existsSync(lockFile)) fs.writeFileSync(path.join(cloneDir, 'node_modules', '.release-train-lock'), sh(`git hash-object "${lockFile}"`, cloneDir));
   } finally { fs.rmSync(busy, { recursive: true, force: true }); }
 }
 
