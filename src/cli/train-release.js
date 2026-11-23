@@ -25,7 +25,11 @@
 //             nobody re-ships it by accident; the next push (the fix) releases normally again. v0.8.2.
 // package.json "releaseTrain" (optional, read from the caller's checkout before anything else):
 //   { "clone": "main-checkout" | "<path>",   release clone = the repo's main checkout (NAKPortal, NAKBase)
-//     "env": { "NODE_OPTIONS": "…" } }       env defaults for build/validation
+//     "env": { "NODE_OPTIONS": "…" },        env defaults for build/validation
+//     "blackout": ["06:25-07:00"] }          Europe/Berlin times in which nobody starts a build (TomicFunds daily
+//                                            run); riders wait until the window ends. RELEASE_TRAIN_BLACKOUT
+//                                            overrides the list, RELEASE_IGNORE_BLACKOUT=1 ignores it; --rollback
+//                                            always ignores it (emergency).
 //   --push    HEAD not on origin yet: rebase onto origin/<branch> and push HEAD:<branch> (3 attempts)
 //   --sha     wait for this commit instead of HEAD
 //   --latest  release whatever origin/<branch> is now (default when run inside the release clone)
@@ -324,6 +328,14 @@ async function runTrain(agentDir, target, forcePush) {
         throw new Error(`Build of ${state.failed.commit.slice(0, 7)} (contains your commit) failed on ${state.failed.host}: ${state.failed.error}`);
       }
 
+      // blackout: nobody starts a build now — keep waiting (a commit that is already live was reported above)
+      const bo = activeBlackout();
+      if (bo) {
+        if (lastHeld !== 'blackout') { log(`⏸ Blackout ${fmt(bo[0])}–${fmt(bo[1])} (Europe/Berlin) — the train starts again at ${fmt(bo[1])}.`); lastHeld = 'blackout'; }
+        if (Date.now() - start > maxWait) throw new Error('Timed out waiting for the blackout to end.');
+        await sleep(POLL_MS);
+        continue;
+      }
       lockSsh ||= await connectFromEnv(b.ENV_FILE);
       const r = await tryAcquireReleaseLock(lockSsh, { REMOTE_BASE_PATH: b.REMOTE_BASE_PATH, target, log });
       if (r.lock) {
@@ -405,6 +417,22 @@ async function rollback(callerDir, target, toVersion) {
   } finally { await lock.release(); }
 }
 
+let BLACKOUT = [];   // [[startMin, endMin], …] — filled in main()
+function parseBlackout(list) {
+  return (Array.isArray(list) ? list : String(list || '').split(','))
+    .map((w) => String(w).trim().match(/^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/))
+    .filter(Boolean).map((m) => [Number(m[1]) * 60 + Number(m[2]), Number(m[3]) * 60 + Number(m[4])]);
+}
+const fmt = (min) => `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
+/** The blackout window we are in right now (Europe/Berlin), or null. Windows may wrap midnight (23:50-00:10). */
+function activeBlackout(now = new Date()) {
+  if (process.env.RELEASE_IGNORE_BLACKOUT === '1') return null;
+  const [h, m] = new Intl.DateTimeFormat('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+    .format(now).split(':').map(Number);
+  const cur = h * 60 + m;
+  return BLACKOUT.find(([a, b]) => (a <= b ? cur >= a && cur < b : cur >= a || cur < b)) || null;
+}
+
 function worktreeOf(repoDir, name) {
   for (const block of sh('git worktree list --porcelain', repoDir).split(/\n\s*\n/)) {
     const wt = (block.match(/^worktree (.+)$/m) || [])[1];
@@ -420,6 +448,7 @@ async function main() {
   const branchArg = opt('branch') || positionals[1] || null;
   if (!target) throw new Error('Usage: release-train <target> [<branch>] [--push] [--sha=<commit>] [--latest]');
   const callerDir = process.cwd();
+  BLACKOUT = parseBlackout(process.env.RELEASE_TRAIN_BLACKOUT ?? trainConfig(callerDir).blackout);
   for (const [k, v] of Object.entries(trainConfig(callerDir).env || {})) {
     if (k === 'NODE_OPTIONS') process.env[k] = [process.env[k], v].filter(Boolean).join(' ');
     else if (process.env[k] === undefined) process.env[k] = String(v);

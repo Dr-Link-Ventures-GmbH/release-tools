@@ -269,6 +269,25 @@ async function scenarioRollback() {
   check(!(await files()).includes('bad.txt') && (await state()).commit === sh('git rev-parse main', path.join(TMP, 'origin.git')), 'live = neue Spitze ohne bad.txt');
 }
 
+async function scenarioBlackout() {
+  console.log('\n9. Sperrzeit (z. B. TomicFunds-Tageslauf 06:25–07:00)');
+  // a window from the current Berlin minute to the start of the minute after next: 1–2 minutes of blackout
+  const berlin = () => new Intl.DateTimeFormat('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+    .format(new Date()).split(':').map(Number);
+  const [h, m] = berlin();
+  const hm = (x) => `${String(Math.floor(x / 60) % 24).padStart(2, '0')}:${String(x % 60).padStart(2, '0')}`;
+  const window = `${hm(h * 60 + m)}-${hm(h * 60 + m + 2)}`;
+  const dir = agent('blackout');
+  commit(dir, 'blackout.txt', '9\n', 'commit during blackout');
+  const t0 = Date.now();
+  const r = await train(dir, ['--push'], { RELEASE_TRAIN_BLACKOUT: window }).done;
+  const waited = Math.round((Date.now() - t0) / 1000);
+  check(/⏸ Blackout/.test(r.out), `Sperrzeit ${window} erkannt`);
+  check(r.code === 0 && /🚂 Driving/.test(r.out), `nach der Sperrzeit gebaut und live (${waited} s)`);
+  const drivingAt = (r.out.match(/\[(\d\d:\d\d):\d\d\] 🚂 Driving/) || [])[1];
+  check(!!drivingAt && drivingAt >= hm(h * 60 + m + 2).slice(0, 5), `Build erst ab ${hm(h * 60 + m + 2)} gestartet (${drivingAt})`);
+}
+
 async function main() {
   const t0 = Date.now();
   try {
@@ -285,6 +304,7 @@ async function main() {
     if (want(6)) await timed(scenarioLegacyRefused);
     if (want(7)) await timed(scenarioBranch);
     if (want(8)) await timed(scenarioRollback);
+    if (want(9)) await timed(scenarioBlackout);
   } finally {
     if (process.env.KEEP !== '1') {
       await remote(`rm -rf ${REMOTE}`).catch(() => {});
