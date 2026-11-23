@@ -1,6 +1,6 @@
 {
   "name": "@linkventures/release-tools",
-  "version": "0.7.8",
+  "version": "0.7.9",
   "private": true,
   "type": "module",
   "description": "Shared release & deploy tooling for Link Ventures projects",
@@ -11,7 +11,8 @@
   },
   "scripts": {
     "release": "node src/cli/release.js",
-    "release:train": "node src/cli/train-release.js"
+    "release:train": "node src/cli/train-release.js",
+    "test": "node test/train.test.mjs"
   },
   "repository": {
     "type": "git",

@@ -33,7 +33,7 @@ import { connectFromEnv } from '../core/ssh.js';
 import { tryAcquireReleaseLock, compareVersions, q } from '../core/release-lock.js';
 import { runDeploy } from './deploy.js';
 
-const POLL_MS = 10_000;
+const POLL_MS = Number(process.env.RELEASE_TRAIN_POLL_MS || 10_000);
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
 const opt = (name) => (args.find((a) => a.startsWith(`--${name}=`)) || '').split('=').slice(1).join('=') || null;
