@@ -15,6 +15,8 @@
 //   4. a rebase conflict on --push aborts cleanly (no rebase left in progress)
 //   5. a commit that changes the bootstrap is deployed with the NEW bootstrap (0.7.5)
 //   6. the old path (release.js, deploy.js) is refused in a train project (0.8.0)
+//   7. release by branch name, with and without a local worktree (0.8.1)
+//   8. --rollback puts the previous content back live under a new version and blocks the bad tip (0.8.2)
 // Everything is removed afterwards (temp dir, remote dir) unless KEEP=1.
 import { execSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -22,6 +24,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { compareVersions } from '../src/core/release-lock.js';
 
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -29,12 +32,18 @@ const TRAIN = path.join(ROOT, 'src', 'cli', 'train-release.js');
 const A = require(process.env.ALPHA_CREDS || 'C:/Users/mail/projects/Claude/alpha-creds.cjs');
 const REMOTE = '/home/temruk/rt-test';
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'rt-test-'));
+const RUNLOG = path.join(os.tmpdir(), 'rt-test-last-runs.log');
+fs.writeFileSync(RUNLOG, '');
 const fwd = (p) => p.replaceAll('\\', '/');
 
 const sh = (cmd, cwd) => execSync(cmd, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
-function check(ok, what) { console.log(`${ok ? '  ✅' : '  ❌'} ${what}`); if (!ok) failures++; }
+let lastOut = '';   // output of the last finished train run, printed when a check fails
+function check(ok, what) {
+  console.log(`${ok ? '  ✅' : '  ❌'} ${what}`);
+  if (!ok) { failures++; console.log(lastOut.split(/\r?\n/).slice(-25).map((l) => `      | ${l}`).join('\n')); }
+}
 
 async function remote(cmd) {
   const ssh = await A.connect();
@@ -49,7 +58,7 @@ function train(cwd, args, env = {}) {
   });
   child.stdout.on('data', (d) => { out += d; });
   child.stderr.on('data', (d) => { out += d; });
-  const done = new Promise((res) => child.on('close', (code) => res({ code, out })));
+  const done = new Promise((res) => child.on('close', (code) => { lastOut = out; fs.appendFileSync(RUNLOG, `\n===== ${path.basename(cwd)} ${args.join(' ')} → exit ${code}\n${out}`); res({ code, out }); }));
   return { child, done, get out() { return out; } };
 }
 const builds = (runs) => runs.reduce((n, r) => n + (r.out.match(/🚂 Driving/g) || []).length, 0);
@@ -88,6 +97,8 @@ async function setup() {
     "if (fs.existsSync('SLOW_BUILD')) await new Promise((r) => setTimeout(r, 90_000));",
     "const v = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;",
     "fs.mkdirSync('dist', { recursive: true }); fs.writeFileSync('dist/index.txt', v + '\\n');",
+    // which repo content went live (rollback check)
+    "fs.writeFileSync('dist/files.txt', fs.readdirSync('.').filter((n) => n.endsWith('.txt')).sort().join('\\n') + '\\n');",
   ].join('\n'));
   fs.writeFileSync(path.join(main, 'scripts', 'bootstrap.js'), bootstrapSource([]));
   fs.writeFileSync(path.join(main, '.gitignore'), 'node_modules/\ndist/\n.env.test\n');
@@ -235,6 +246,29 @@ async function scenarioBranch() {
   check(!/release-train-/.test(sh('git worktree list', main)), 'temporärer Worktree wieder entfernt');
 }
 
+async function scenarioRollback() {
+  console.log('\n8. Rollback auf die vorige Version');
+  const main = path.join(TMP, 'main');
+  const state = async () => JSON.parse((await remote(`cat ${REMOTE}/.release-state-test.json`)) || '{}');
+  const files = async () => remote(`cat ${REMOTE}/test/dist/files.txt`);
+  const dir = agent('bad');
+  commit(dir, 'bad.txt', 'oops\n', 'bad change');
+  check((await train(dir, ['--push']).done).code === 0, 'fehlerhafte Version released');
+  const bad = await state();
+  check((await files()).includes('bad.txt'), 'bad.txt ist live');
+  const rb = await train(main, ['--rollback']).done;
+  const after = await state();
+  check(rb.code === 0 && /Rolling back/.test(rb.out), 'Rollback läuft durch');
+  check(!(await files()).includes('bad.txt'), 'bad.txt ist nicht mehr live');
+  check(compareVersions(after.version, bad.version) > 0 && after.rolledBack?.from === bad.version,
+    `neue Versionsnummer ${after.version} > ${bad.version}, Rollback auf ${after.rolledBack?.to}`);
+  const rider = await train(dir, ['--latest']).done;
+  check(rider.code !== 0 && /rolled back/.test(rider.out) && !/🚂 Driving/.test(rider.out), 'Mitfahrer liefert den zurückgerollten Stand nicht erneut aus');
+  removeAndCommit(dir, 'bad.txt', 'fix: drop bad change');
+  check((await train(dir, ['--push']).done).code === 0, 'Fix danach normal released');
+  check(!(await files()).includes('bad.txt') && (await state()).commit === sh('git rev-parse main', path.join(TMP, 'origin.git')), 'live = neue Spitze ohne bad.txt');
+}
+
 async function main() {
   const t0 = Date.now();
   try {
@@ -242,13 +276,15 @@ async function main() {
     // ONLY=1,5 runs a subset (scenario 1 always runs first: it sets up the release clone)
     const only = (process.env.ONLY || '').split(',').filter(Boolean);
     const want = (n) => !only.length || only.includes(String(n));
-    await scenarioParallel();
-    if (want(2)) await scenarioKilledDriver();
-    if (want(3)) await scenarioBrokenBuild();
-    if (want(4)) await scenarioConflict();
-    if (want(5)) await scenarioBootstrapChange();
-    if (want(6)) await scenarioLegacyRefused();
-    if (want(7)) await scenarioBranch();
+    const timed = async (fn) => { const t = Date.now(); await fn(); console.log(`  ⏱ ${Math.round((Date.now() - t) / 1000)} s`); };
+    await timed(scenarioParallel);
+    if (want(2)) await timed(scenarioKilledDriver);
+    if (want(3)) await timed(scenarioBrokenBuild);
+    if (want(4)) await timed(scenarioConflict);
+    if (want(5)) await timed(scenarioBootstrapChange);
+    if (want(6)) await timed(scenarioLegacyRefused);
+    if (want(7)) await timed(scenarioBranch);
+    if (want(8)) await timed(scenarioRollback);
   } finally {
     if (process.env.KEEP !== '1') {
       await remote(`rm -rf ${REMOTE}`).catch(() => {});

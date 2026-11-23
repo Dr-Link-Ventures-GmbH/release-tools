@@ -20,6 +20,9 @@
 //   <branch> / --branch  release that branch: it is rebased onto origin/<main> IN ITS OWN WORKTREE (a temporary
 //             detached one if it has none locally, e.g. pushed from the NUC) and pushed as main (implies --push).
 //             Replaces the per-project release-locked.mjs wrappers (NAKPortal, NAKBase) since v0.8.1.
+//   --rollback[=<version>]  put the previous release (or <version>) back live — as a NEW version number, since the
+//             server never goes backwards. The tip of main at that moment is marked failed, so riders stop and
+//             nobody re-ships it by accident; the next push (the fix) releases normally again. v0.8.2.
 // package.json "releaseTrain" (optional, read from the caller's checkout before anything else):
 //   { "clone": "main-checkout" | "<path>",   release clone = the repo's main checkout (NAKPortal, NAKBase)
 //     "env": { "NODE_OPTIONS": "…" } }       env defaults for build/validation
@@ -336,6 +339,72 @@ async function runTrain(agentDir, target, forcePush) {
   } finally { ssh.dispose(); lockSsh?.dispose(); }
 }
 
+/** Rollback: rebuild an earlier release tag, deploy it as a new version, block the current tip until a new push. */
+async function rollback(callerDir, target, toVersion) {
+  const cloneDir = cloneDirFor(callerDir);
+  await ensureClone(cloneDir, callerDir);
+  let b = await loadBootstrap(cloneDir);
+  b = { ...b, target };
+  const maxWait = Number(process.env.RELEASE_TRAIN_MAX_WAIT_MIN || 90) * 60_000;
+  const start = Date.now();
+  const ssh = await connectFromEnv(b.ENV_FILE);
+  let lock;
+  for (;;) {
+    const r = await tryAcquireReleaseLock(ssh, { REMOTE_BASE_PATH: b.REMOTE_BASE_PATH, target, log });
+    if (r.lock) { lock = r.lock; break; }
+    if (Date.now() - start > maxWait) { ssh.dispose(); throw new Error(`Timed out waiting for the release lock (held by ${r.held}).`); }
+    log(`⏳ A release is running (${r.held}) — rollback waits for it…`);
+    await sleep(POLL_MS);
+  }
+  try {
+    const branch = b.REPO_BRANCH;
+    run('git fetch origin --tags --force --prune --quiet', cloneDir);
+    const state = await readState(ssh, b, target);
+    if (!state.version) throw new Error('Nothing known to be live — no rollback target.');
+    const tags = sh('git tag -l "v*"', cloneDir).split('\n').map((t) => t.replace(/^v/, '')).filter((v) => /^\d+\.\d+\.\d+$/.test(v));
+    const older = tags.filter((v) => compareVersions(v, state.version) < 0).sort((x, y) => compareVersions(y, x));
+    const backTo = toVersion || older[0];
+    if (!backTo || !tags.includes(backTo)) throw new Error(`No release tag ${toVersion ? `v${toVersion}` : 'before ' + state.version} found.`);
+    // a train tag sits on a "release v…" commit on top of the main commit; legacy tags sit on main itself
+    // no "^" in these git expressions: cmd.exe (Windows execSync) eats it
+    const tagCommit = sh(`git rev-list -n 1 v${backTo}`, cloneDir);
+    const base = /^release v/.test(sh(`git log -1 --format=%s ${tagCommit}`, cloneDir)) ? sh(`git rev-parse ${tagCommit}~1`, cloneDir) : tagCommit;
+    const badTip = sh(`git rev-parse origin/${branch}`, cloneDir);
+    log(`⏪ Rolling back ${target}: ${state.version} (${String(state.commit).slice(0, 7)}) → content of v${backTo} (${base.slice(0, 7)})`);
+
+    run(`git checkout -q -f --detach ${tagCommit}`, cloneDir);
+    b = { ...(await loadBootstrap(cloneDir)), target };   // the bootstrap of that release
+    const lockFile = path.join(cloneDir, 'package-lock.json');
+    const stamp = path.join(cloneDir, 'node_modules', '.release-train-lock');
+    const want = fs.existsSync(lockFile) ? sh(`git hash-object "${lockFile}"`, cloneDir) : 'none';
+    if (!fs.existsSync(stamp) || fs.readFileSync(stamp, 'utf8').trim() !== want) {
+      run('npm install --no-audit --no-fund', cloneDir); fs.writeFileSync(stamp, want);
+    }
+    const max = tags.reduce((a, v) => (compareVersions(v, a) > 0 ? v : a), '0.0.0');
+    let version = calverNext(max);
+    while (tags.includes(version)) version = calverNext(version);
+    run(`npm version ${version} --no-git-tag-version --allow-same-version`, cloneDir);
+    if (sh('git status --porcelain --untracked-files=no', cloneDir)) run(`git commit -q -a --no-verify -m "release v${version} (rollback to v${backTo})"`, cloneDir);
+    const releaseCommit = sh('git rev-parse HEAD', cloneDir);
+    run('npm run build', cloneDir, { BUILD_TARGET: target });   // no validation: this code was validated when it first went live
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    run(`node "${path.join(here, 'write-version-info.js')}"`, cloneDir, { VERSION: version, DIST_DIR: b.DIST_DIR });
+    run(`git tag v${version} ${releaseCommit}`, cloneDir);
+    run(`git push -q --no-verify origin refs/tags/v${version}`, cloneDir);
+    const pkg = JSON.parse(fs.readFileSync(b.PACKAGE_JSON_FILE, 'utf8'));
+    await runDeploy({ ...b, viaTrain: true, packageJson: { ...pkg, version } });
+    const by = `${os.userInfo().username}@${os.hostname()}`;
+    await writeState(ssh, b, target, {
+      commit: base, version, deployedAt: new Date().toISOString(), host: os.hostname(),
+      rolledBack: { from: state.version, fromCommit: state.commit, to: backTo, by, at: new Date().toISOString() },
+      // block the current tip: riders stop, nobody ships it again by accident; a new push gets a fresh build
+      failed: { commit: badTip, version: state.version, host: os.hostname(), at: new Date().toISOString(),
+                error: `rolled back to v${backTo} by ${by} — push a fix, then release again` },
+    });
+    log(`⏪ ${version} (= content of v${backTo}) is live on ${target}. main stays blocked at ${badTip.slice(0, 7)} until the next push.`);
+  } finally { await lock.release(); }
+}
+
 function worktreeOf(repoDir, name) {
   for (const block of sh('git worktree list --porcelain', repoDir).split(/\n\s*\n/)) {
     const wt = (block.match(/^worktree (.+)$/m) || [])[1];
@@ -355,6 +424,8 @@ async function main() {
     if (k === 'NODE_OPTIONS') process.env[k] = [process.env[k], v].filter(Boolean).join(' ');
     else if (process.env[k] === undefined) process.env[k] = String(v);
   }
+  const rb = args.find((a) => a === '--rollback' || a.startsWith('--rollback='));
+  if (rb) return rollback(callerDir, target, rb.includes('=') ? rb.split('=')[1].replace(/^v/, '') : null);
   if (!branchArg) return runTrain(callerDir, target, false);
 
   // the branch's own worktree, or a temporary detached one of the local branch / origin branch
