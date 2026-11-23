@@ -92,9 +92,18 @@ async function ensureClone(cloneDir, agentDir) {
       run(`git clone "${url}" "${cloneDir}"`, path.dirname(cloneDir));
     }
     const mainCheckout = path.dirname(path.resolve(agentDir, sh('git rev-parse --git-common-dir', agentDir)));
+    // local config the repo does not carry: .env* and every other git-ignored FILE in the project root
+    // (e.g. .google-service-account.json, which BetaOSBase's preinstall check requires) — never directories
     for (const src of [agentDir, mainCheckout]) {
-      for (const f of fs.readdirSync(src).filter((n) => n.startsWith('.env') && n !== '.env.example')) {
-        if (!fs.existsSync(path.join(cloneDir, f))) fs.copyFileSync(path.join(src, f), path.join(cloneDir, f));
+      const ignored = (shTry('git ls-files --others --ignored --exclude-standard --directory', src) || '').split(/\r?\n/)
+        .map((n) => n.trim()).filter((n) => n && !n.includes('/'));
+      const names = new Set([...fs.readdirSync(src).filter((n) => n.startsWith('.env')), ...ignored]);
+      for (const n of names) {
+        if (n === '.env.example') continue;
+        const from = path.join(src, n);
+        let st; try { st = fs.statSync(from); } catch { continue; }
+        if (!st.isFile() || st.size > 1_000_000) continue;
+        if (!fs.existsSync(path.join(cloneDir, n))) { fs.copyFileSync(from, path.join(cloneDir, n)); log(`📄 copied ${n} into the release clone`); }
       }
     }
     log('📦 Installing dependencies in the release clone');
