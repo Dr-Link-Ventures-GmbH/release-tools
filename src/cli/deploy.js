@@ -12,7 +12,7 @@ import fs from 'fs';
 import os from 'os';
 import { execSync } from 'child_process';
 import { connectFromEnv } from '../core/ssh.js';
-import { compareVersions } from '../core/release-lock.js';
+import { compareVersions, assertNotTrainProject } from '../core/release-lock.js';
 import { pathToFileURL } from 'url';
 import loadProjectBootstrap from '../core/load-project-bootstrap.js';
 
@@ -35,6 +35,10 @@ export async function runDeploy(bootstrap) {
 
   log(`🔐 Connecting to server (${target})...`);
   const ssh = await connectFromEnv(ENV_FILE);
+  // v0.8.0: a direct deploy (npm run deploy / release.js) is refused in train projects; the train passes viaTrain
+  if (!bootstrap.viaTrain) {
+    try { await assertNotTrainProject(ssh, REMOTE_BASE_PATH, target); } catch (e) { ssh.dispose(); throw e; }
+  }
 
   // v0.6.0: never overwrite a newer version. Another agent may have released (or deployed by hand) in the meantime;
   // its build.info / version.json on the server then carries a higher version than ours. RELEASE_FORCE=1 overrides.

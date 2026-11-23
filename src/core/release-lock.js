@@ -100,3 +100,19 @@ export function compareVersions(a, b) {
   }
   return 0;
 }
+
+/**
+ * v0.8.0: a project that releases with the train (its server carries <base>/.release-state-<target>.json) must not
+ * be released or deployed the old way any more — that path writes version commits onto main and deploys whatever
+ * the local checkout holds, past the train. RELEASE_LEGACY=1 overrides (emergencies only).
+ */
+export async function assertNotTrainProject(ssh, REMOTE_BASE_PATH, target) {
+  if (process.env.RELEASE_LEGACY === '1') return;
+  const state = `${REMOTE_BASE_PATH.replace(/\/+$/, '')}/.release-state-${target}.json`;
+  const r = await ssh.execCommand(`test -f ${q(state)} && echo TRAIN`);
+  if (r.stdout.trim() === 'TRAIN') {
+    throw new Error(`This project releases with the release train (${state} exists). ` +
+      `Use: npm run release:train -- ${target} --push   (NAKPortal/NAKBase: npm run release:prod -- <branch>). ` +
+      'RELEASE_LEGACY=1 overrides — emergencies only.');
+  }
+}

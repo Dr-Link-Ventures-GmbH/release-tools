@@ -22,7 +22,8 @@ import path from 'path';
 import readline from 'readline';
 import loadProjectBootstrap from '../core/load-project-bootstrap.js';
 import { runDeploy } from './deploy.js';
-import { acquireReleaseLock } from '../core/release-lock.js';
+import { acquireReleaseLock, assertNotTrainProject } from '../core/release-lock.js';
+import { connectFromEnv } from '../core/ssh.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -143,6 +144,9 @@ async function main() {
   // 1b. Other agents: refuse a dirty checkout before touching anything, then take the server-side release lock
   // (one release per project and target across all machines, v0.6.0). Everything from pull to push runs under it,
   // so the pull sees the previous release's commit and tag.
+  // v0.8.0: train projects refuse the old path before any git operation
+  { const ssh = await connectFromEnv(bootstrap.ENV_FILE);
+    try { await assertNotTrainProject(ssh, bootstrap.REMOTE_BASE_PATH, target); } finally { ssh.dispose(); } }
   if (!flags.noGit) ensureCleanGit();
   const lock = await acquireReleaseLock(bootstrap);
   try {

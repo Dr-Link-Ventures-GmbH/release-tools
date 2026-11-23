@@ -14,6 +14,7 @@
 //   3. a broken build of main is remembered → a rider fails fast without rebuilding; a fix push heals it
 //   4. a rebase conflict on --push aborts cleanly (no rebase left in progress)
 //   5. a commit that changes the bootstrap is deployed with the NEW bootstrap (0.7.5)
+//   6. the old path (release.js, deploy.js) is refused in a train project (0.8.0)
 // Everything is removed afterwards (temp dir, remote dir) unless KEEP=1.
 import { execSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -190,6 +191,23 @@ async function scenarioBootstrapChange() {
   check((await remote(`test -f ${marker} && echo yes`)) === 'yes', 'neuer Post-Deploy-Befehl wurde ausgeführt');
 }
 
+async function scenarioLegacyRefused() {
+  console.log('\n6. Alter Weg (release.js / deploy.js) in einem Zug-Projekt');
+  const main = path.join(TMP, 'main');
+  const run = (script, args) => new Promise((res) => {
+    let out = '';
+    const c = spawn(process.execPath, [path.join(ROOT, 'src', 'cli', script), 'test', ...args], { cwd: main });
+    c.stdout.on('data', (d) => { out += d; }); c.stderr.on('data', (d) => { out += d; });
+    c.on('close', (code) => res({ code, out }));
+  });
+  const before = sh('git rev-parse main', path.join(TMP, 'origin.git'));
+  const rel = await run('release.js', ['--patch', '--branch=none']);
+  check(rel.code !== 0 && /release train/.test(rel.out), 'npm run release wird abgewiesen');
+  const dep = await run('deploy.js', []);
+  check(dep.code !== 0 && /release train/.test(dep.out), 'npm run deploy wird abgewiesen');
+  check(sh('git rev-parse main', path.join(TMP, 'origin.git')) === before, 'main unverändert');
+}
+
 async function main() {
   const t0 = Date.now();
   try {
@@ -202,6 +220,7 @@ async function main() {
     if (want(3)) await scenarioBrokenBuild();
     if (want(4)) await scenarioConflict();
     if (want(5)) await scenarioBootstrapChange();
+    if (want(6)) await scenarioLegacyRefused();
   } finally {
     if (process.env.KEEP !== '1') {
       await remote(`rm -rf ${REMOTE}`).catch(() => {});

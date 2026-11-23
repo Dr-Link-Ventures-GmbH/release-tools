@@ -233,7 +233,7 @@ async function drive(ssh, b0, cloneDir, target) {
   run(`git tag v${version} ${releaseCommit}`, cloneDir);
   run(`git push -q --no-verify origin refs/tags/v${version}`, cloneDir);   // validated above, skip pre-push hooks
 
-  await runDeploy({ ...b, packageJson: { ...pkg, version } });
+  await runDeploy({ ...b, viaTrain: true, packageJson: { ...pkg, version } });
   await writeState(ssh, b, target, { commit: tip, version, deployedAt: new Date().toISOString(), host: os.hostname(), failed: null });
   log(`🚀 ${version} (${tip.slice(0, 7)}) is live on ${target}.`);
 }
