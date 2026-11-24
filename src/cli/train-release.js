@@ -320,17 +320,19 @@ async function runTrain(agentDir, target, forcePush) {
 
   const maxWait = Number(process.env.RELEASE_TRAIN_MAX_WAIT_MIN || 90) * 60_000;
   const start = Date.now();
-  const ssh = await connectFromEnv(b.ENV_FILE);
   let lastHeld = '';
-  let lockSsh = null;   // one connection for all lock attempts of this waiter (was: a new one every poll)
-  try {
-    for (;;) {
+  // the live commit may be newer than our last fetch (another machine drove): fetch once if it is unknown here
+  const contained = (sha) => {
+    if (!inClone && shTry(`git cat-file -e ${sha}`, gitDir) === null) shTry(`git fetch -q origin ${branch}`, agentDir);
+    return isAncestor(want, sha, gitDir);
+  };
+  for (;;) {
+    // v0.8.5: a FRESH connection per poll — a connection held idle across waits/blackout died with ECONNRESET
+    // and crashed the run. Each iteration opens, uses and disposes its own; the lock owns its connection while held.
+    const ssh = await connectFromEnv(b.ENV_FILE);
+    let r = null;
+    try {
       const state = await readState(ssh, b, target);
-      // the live commit may be newer than our last fetch (another machine drove): fetch once if it is unknown here
-      const contained = (sha) => {
-        if (!inClone && shTry(`git cat-file -e ${sha}`, gitDir) === null) shTry(`git fetch -q origin ${branch}`, agentDir);
-        return isAncestor(want, sha, gitDir);
-      };
       if (state.commit && contained(state.commit)) {
         log(`✅ ${want.slice(0, 7)} is live on ${target} in ${state.version} (${String(state.commit).slice(0, 7)}).`);
         return;
@@ -338,30 +340,36 @@ async function runTrain(agentDir, target, forcePush) {
       // a recorded failure only stops us while it is still the tip — a newer push gets a fresh build
       const tipNow = state.failed?.commit && shTry(`git ls-remote origin refs/heads/${branch}`, gitDir)?.split(/\s/)[0];
       if (state.failed?.commit && state.failed.commit === tipNow && contained(state.failed.commit)) {
-        throw new Error(`Build of ${state.failed.commit.slice(0, 7)} (contains your commit) failed on ${state.failed.host}: ${state.failed.error}`);
+        throw Object.assign(new Error(`Build of ${state.failed.commit.slice(0, 7)} (contains your commit) failed on ${state.failed.host}: ${state.failed.error}`), { fatal: true });
       }
-
-      // blackout: nobody starts a build now — keep waiting (a commit that is already live was reported above)
+      // blackout: nobody starts a build now — keep waiting (an already-live commit was reported above)
       const bo = activeBlackout();
       if (bo) {
         if (lastHeld !== 'blackout') { log(`⏸ Blackout ${fmt(bo[0])}–${fmt(bo[1])} (Europe/Berlin) — the train starts again at ${fmt(bo[1])}.`); lastHeld = 'blackout'; }
-        if (Date.now() - start > maxWait) throw new Error('Timed out waiting for the blackout to end.');
+        if (Date.now() - start > maxWait) throw Object.assign(new Error('Timed out waiting for the blackout to end.'), { fatal: true });
+        ssh.dispose();
         await sleep(POLL_MS);
         continue;
       }
-      lockSsh ||= await connectFromEnv(b.ENV_FILE);
-      const r = await tryAcquireReleaseLock(lockSsh, { REMOTE_BASE_PATH: b.REMOTE_BASE_PATH, target, log });
-      if (r.lock) {
-        const owned = lockSsh; lockSsh = null;   // the lock owns (and disposes) this connection now
-        try { await drive(owned, b, cloneDir, target); }
-        finally { await r.lock.release(); }
-        continue;   // re-check: our commit is normally part of what we just built
-      }
-      if (Date.now() - start > maxWait) throw new Error(`Timed out waiting for the release train (held by ${r.held}).`);
-      if (r.held !== lastHeld) { log(`⏳ Train is running (${r.held}, ${r.age}s) — your commit rides along or goes with the next one.`); lastHeld = r.held; }
+      r = await tryAcquireReleaseLock(ssh, { REMOTE_BASE_PATH: b.REMOTE_BASE_PATH, target, log });
+    } catch (e) {
+      ssh.dispose();
+      if (e.fatal) throw e;
+      if (Date.now() - start > maxWait) throw e;
+      log(`↻ Poll hiccup (${String(e.message).split('\n')[0]}) — retrying`);
       await sleep(POLL_MS);
+      continue;
     }
-  } finally { ssh.dispose(); lockSsh?.dispose(); }
+    if (r.lock) {
+      try { await drive(ssh, b, cloneDir, target); }   // ssh is owned (and disposed) by the lock now
+      finally { await r.lock.release(); }
+      continue;   // re-check: our commit is normally part of what we just built
+    }
+    ssh.dispose();
+    if (Date.now() - start > maxWait) throw new Error(`Timed out waiting for the release train (held by ${r.held}).`);
+    if (r.held !== lastHeld) { log(`⏳ Train is running (${r.held}, ${r.age}s) — your commit rides along or goes with the next one.`); lastHeld = r.held; }
+    await sleep(POLL_MS);
+  }
 }
 
 /** Rollback: rebuild an earlier release tag, deploy it as a new version, block the current tip until a new push. */
