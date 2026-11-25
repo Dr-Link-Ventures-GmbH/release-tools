@@ -17,6 +17,8 @@
 //   6. the old path (release.js, deploy.js) is refused in a train project (0.8.0)
 //   7. release by branch name, with and without a local worktree (0.8.1)
 //   8. --rollback puts the previous content back live under a new version and blocks the bad tip (0.8.2)
+//   9. blackout window: no build starts inside it (0.8.3)
+//  10. busy check: while the server reports a running job, no build starts; it goes once the job is done (0.8.6)
 // Everything is removed afterwards (temp dir, remote dir) unless KEEP=1.
 import { execSync, spawn } from 'node:child_process';
 import http from 'node:http';
@@ -301,6 +303,22 @@ async function scenarioBlackout() {
   check(!!drivingAt && drivingAt >= hm(h * 60 + m + 2).slice(0, 5), `Build erst ab ${hm(h * 60 + m + 2)} gestartet (${drivingAt})`);
 }
 
+async function scenarioBusy() {
+  console.log('\n10. Server beschäftigt (z. B. TomicFunds-Tageslauf oder Modell-Freigabe läuft)');
+  await remote(`echo "assess-all 97 of 2579" > ${REMOTE}/BUSY`);
+  const dir = agent('busy');
+  commit(dir, 'busy.txt', '10\n', 'commit while server busy');
+  const run = train(dir, ['--push'], { RELEASE_TRAIN_BUSY_CHECK: `cat ${REMOTE}/BUSY 2>/dev/null` });
+  await sleep(15_000);
+  check(/⏸ Server busy \(assess-all 97 of 2579\)/.test(run.out), 'laufender Job erkannt');
+  check(!/🚂 Driving/.test(run.out), 'kein Build, solange der Job läuft');
+  await remote(`rm -f ${REMOTE}/BUSY`);
+  const r = await run.done;
+  check(r.code === 0 && /🚂 Driving/.test(r.out) && /is live on test/.test(r.out), 'nach Ende des Jobs gebaut und live');
+  const bad = await train(dir, [], { RELEASE_TRAIN_BUSY_CHECK: 'exit 7' }).done;
+  check(bad.code === 0, 'fehlerhafte Prüfung blockiert nicht');
+}
+
 async function main() {
   const t0 = Date.now();
   try {
@@ -318,6 +336,7 @@ async function main() {
     if (want(7)) await timed(scenarioBranch);
     if (want(8)) await timed(scenarioRollback);
     if (want(9)) await timed(scenarioBlackout);
+    if (want(10)) await timed(scenarioBusy);
   } finally {
     if (process.env.KEEP !== '1') {
       await remote(`rm -rf ${REMOTE}`).catch(() => {});

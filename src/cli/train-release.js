@@ -30,6 +30,13 @@
 //                                            run); riders wait until the window ends. RELEASE_TRAIN_BLACKOUT
 //                                            overrides the list, RELEASE_IGNORE_BLACKOUT=1 ignores it; --rollback
 //                                            always ignores it (emergency).
+//     "busyCheck": "<shell command>" }       v0.8.6: run on the deploy server before a build starts and again right
+//                                            before the deploy. Non-empty output (exit 0) = a long job is running
+//                                            there (TomicFunds: daily run, model release) that a service restart
+//                                            would break off; the train waits until it is empty. Errors count as
+//                                            free. RELEASE_TRAIN_BUSY_CHECK overrides it, RELEASE_IGNORE_BUSY=1
+//                                            skips it, RELEASE_TRAIN_MAX_BUSY_MIN
+//                                            (default 240) ends the wait with an error; --rollback ignores it.
 //   --push    HEAD not on origin yet: rebase onto origin/<branch> and push HEAD:<branch> (3 attempts)
 //   --sha     wait for this commit instead of HEAD
 //   --latest  release whatever origin/<branch> is now (default when run inside the release clone)
@@ -261,6 +268,14 @@ async function drive(ssh, b0, cloneDir, target) {
   run(`git tag v${version} ${releaseCommit}`, cloneDir);
   run(`git push -q --no-verify origin refs/tags/v${version}`, cloneDir);   // validated above, skip pre-push hooks
 
+  // v0.8.6: a job may have started on the server while we built (model release) — the deploy restarts the service
+  for (let t0 = Date.now(), said = ''; ;) {
+    const busy = await serverBusy(ssh);
+    if (!busy) break;
+    if (said !== busy) { log(`⏸ Built ${version}, but the server is busy (${busy}) — deploying when it is done.`); said = busy; }
+    if (Date.now() - t0 > MAX_BUSY()) throw new Error(`Server still busy after ${MAX_BUSY() / 60_000} min (${busy}); ${version} is built and tagged but not deployed. RELEASE_IGNORE_BUSY=1 deploys anyway.`);
+    await sleep(POLL_MS);
+  }
   try { await runDeploy({ ...b, viaTrain: true, packageJson: { ...pkg, version } }); }
   catch (e) {
     await notify(`🔴 ${label(cloneDir, target)}: Deploy von ${version} (\`${tip.slice(0, 7)}\`) fehlgeschlagen (${os.hostname()}).\n> ${String(e.message).slice(0, 300)}\nDer nächste Release-Aufruf versucht es erneut.`);
@@ -321,6 +336,7 @@ async function runTrain(agentDir, target, forcePush) {
   const maxWait = Number(process.env.RELEASE_TRAIN_MAX_WAIT_MIN || 90) * 60_000;
   const start = Date.now();
   let lastHeld = '';
+  let busySince = null;   // busy waits have their own limit (MAX_BUSY), the train limit counts only the rest
   // the live commit may be newer than our last fetch (another machine drove): fetch once if it is unknown here
   const contained = (sha) => {
     if (!inClone && shTry(`git cat-file -e ${sha}`, gitDir) === null) shTry(`git fetch -q origin ${branch}`, agentDir);
@@ -351,6 +367,17 @@ async function runTrain(agentDir, target, forcePush) {
         await sleep(POLL_MS);
         continue;
       }
+      // v0.8.6: a long job on the server (daily run, model release) — do not start a build that would restart under it
+      const busy = await serverBusy(ssh);
+      if (busy) {
+        busySince ??= Date.now();
+        if (lastHeld !== 'busy:' + busy) { log(`⏸ Server busy (${busy}) — the train waits until it is done.`); lastHeld = 'busy:' + busy; }
+        if (Date.now() - busySince > MAX_BUSY()) throw Object.assign(new Error(`Server still busy after ${MAX_BUSY() / 60_000} min (${busy}). RELEASE_IGNORE_BUSY=1 releases anyway.`), { fatal: true });
+        ssh.dispose();
+        await sleep(POLL_MS);
+        continue;
+      }
+      busySince = null;
       r = await tryAcquireReleaseLock(ssh, { REMOTE_BASE_PATH: b.REMOTE_BASE_PATH, target, log });
     } catch (e) {
       ssh.dispose();
@@ -440,6 +467,18 @@ async function rollback(callerDir, target, toVersion) {
 }
 
 let BLACKOUT = [];   // [[startMin, endMin], …] — filled in main()
+let BUSY_CHECK = null;   // shell command from package.json releaseTrain.busyCheck — filled in main()
+
+/** v0.8.6: what the deploy server reports as running (one line per job), or null when free / no check / check error. */
+async function serverBusy(ssh) {
+  if (!BUSY_CHECK || process.env.RELEASE_IGNORE_BUSY === '1') return null;
+  try {
+    const r = await ssh.execCommand(BUSY_CHECK);
+    const out = String(r.stdout || '').trim();
+    return r.code === 0 && out ? out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).join('; ') : null;
+  } catch { return null; }   // a broken check must never block every release
+}
+const MAX_BUSY = () => Number(process.env.RELEASE_TRAIN_MAX_BUSY_MIN || 240) * 60_000;
 function parseBlackout(list) {
   return (Array.isArray(list) ? list : String(list || '').split(','))
     .map((w) => String(w).trim().match(/^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/))
@@ -471,6 +510,7 @@ async function main() {
   if (!target) throw new Error('Usage: release-train <target> [<branch>] [--push] [--sha=<commit>] [--latest]');
   const callerDir = process.cwd();
   BLACKOUT = parseBlackout(process.env.RELEASE_TRAIN_BLACKOUT ?? trainConfig(callerDir).blackout);
+  BUSY_CHECK = process.env.RELEASE_TRAIN_BUSY_CHECK ?? (trainConfig(callerDir).busyCheck || null);
   for (const [k, v] of Object.entries(trainConfig(callerDir).env || {})) {
     if (k === 'NODE_OPTIONS') process.env[k] = [process.env[k], v].filter(Boolean).join(' ');
     else if (process.env[k] === undefined) process.env[k] = String(v);
