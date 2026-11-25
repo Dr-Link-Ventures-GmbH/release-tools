@@ -272,7 +272,7 @@ async function drive(ssh, b0, cloneDir, target) {
   for (let t0 = Date.now(), said = ''; ;) {
     const busy = await serverBusy(ssh);
     if (!busy) break;
-    if (said !== busy) { log(`⏸ Built ${version}, but the server is busy (${busy}) — deploying when it is done.`); said = busy; }
+    if (said !== busy.replace(/\d+/g, '#')) { log(`⏸ Built ${version}, but the server is busy (${busy}) — deploying when it is done.`); said = busy.replace(/\d+/g, '#'); }
     if (Date.now() - t0 > MAX_BUSY()) throw new Error(`Server still busy after ${MAX_BUSY() / 60_000} min (${busy}); ${version} is built and tagged but not deployed. RELEASE_IGNORE_BUSY=1 deploys anyway.`);
     await sleep(POLL_MS);
   }
@@ -371,7 +371,9 @@ async function runTrain(agentDir, target, forcePush) {
       const busy = await serverBusy(ssh);
       if (busy) {
         busySince ??= Date.now();
-        if (lastHeld !== 'busy:' + busy) { log(`⏸ Server busy (${busy}) — the train waits until it is done.`); lastHeld = 'busy:' + busy; }
+        // v0.8.7: report once per kind of job, not on every progress count ("… 2304 von 2579" changed each poll)
+        const kind = 'busy:' + busy.replace(/\d+/g, '#');
+        if (lastHeld !== kind) { log(`⏸ Server busy (${busy}) — the train waits until it is done.`); lastHeld = kind; }
         if (Date.now() - busySince > MAX_BUSY()) throw Object.assign(new Error(`Server still busy after ${MAX_BUSY() / 60_000} min (${busy}). RELEASE_IGNORE_BUSY=1 releases anyway.`), { fatal: true });
         ssh.dispose();
         await sleep(POLL_MS);
