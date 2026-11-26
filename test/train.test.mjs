@@ -19,6 +19,7 @@
 //   8. --rollback puts the previous content back live under a new version and blocks the bad tip (0.8.2)
 //   9. blackout window: no build starts inside it (0.8.3)
 //  10. busy check: while the server reports a running job, no build starts; it goes once the job is done (0.8.6)
+//  11. an agent with an older checkout (no busyCheck) still waits: the check of main in the release clone counts (0.8.8)
 // Everything is removed afterwards (temp dir, remote dir) unless KEEP=1.
 import { execSync, spawn } from 'node:child_process';
 import http from 'node:http';
@@ -319,6 +320,27 @@ async function scenarioBusy() {
   check(bad.code === 0, 'fehlerhafte Prüfung blockiert nicht');
 }
 
+async function scenarioBusyFromMain() {
+  console.log('\n11. Älterer Checkout ohne busyCheck: es gilt die Prüfung von main im Release-Klon');
+  const old = agent('busy-old');                                   // created before main gets the busy check
+  const a = agent('busy-cfg');
+  const pkg = JSON.parse(fs.readFileSync(path.join(a, 'package.json'), 'utf8'));
+  pkg.releaseTrain = { ...(pkg.releaseTrain || {}), busyCheck: `cat ${REMOTE}/BUSY 2>/dev/null` };
+  fs.writeFileSync(path.join(a, 'package.json'), JSON.stringify(pkg, null, 2));
+  sh('git add package.json && git commit -q -m "busy check on main"', a);
+  const first = await train(a, ['--push']).done;
+  check(first.code === 0, 'main mit busyCheck released');
+  await remote(`echo "Modell-Freigabe 5 von 9" > ${REMOTE}/BUSY`);
+  commit(old, 'old.txt', '11\n', 'commit from an older checkout');
+  const run = train(old, ['--push']);
+  await sleep(15_000);
+  check(/⏸ (Server busy|Built .* but the server is busy)/.test(run.out), 'älterer Checkout wartet trotzdem');
+  check(!/is live on test/.test(run.out), 'kein Deploy, solange der Job läuft');
+  await remote(`rm -f ${REMOTE}/BUSY`);
+  const r = await run.done;
+  check(r.code === 0 && /is live on test/.test(r.out), 'nach Ende des Jobs live');
+}
+
 async function main() {
   const t0 = Date.now();
   try {
@@ -337,6 +359,7 @@ async function main() {
     if (want(8)) await timed(scenarioRollback);
     if (want(9)) await timed(scenarioBlackout);
     if (want(10)) await timed(scenarioBusy);
+    if (want(11)) await timed(scenarioBusyFromMain);
   } finally {
     if (process.env.KEEP !== '1') {
       await remote(`rm -rf ${REMOTE}`).catch(() => {});

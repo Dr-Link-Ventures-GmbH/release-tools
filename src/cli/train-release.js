@@ -207,6 +207,9 @@ async function drive(ssh, b0, cloneDir, target) {
   const tip = sh('git rev-parse HEAD', cloneDir);
   // the project bootstrap may have changed with the commits just pulled (deploy items, secrets): load it fresh
   b = { ...(await loadBootstrap(cloneDir)), target };
+  // v0.8.8: the busy check of what is being built (main in the release clone), not only the caller's own checkout:
+  // a session with an older checkout knew no busy check and deployed into a running model release (26.11.2026)
+  if (process.env.RELEASE_TRAIN_BUSY_CHECK === undefined) BUSY_CHECK = trainConfig(cloneDir).busyCheck || BUSY_CHECK;
 
   const state = await readState(ssh, b, target);
   if (state.commit && isAncestor(tip, state.commit, cloneDir)) { log(`✅ ${tip.slice(0, 7)} is already live (${state.version}).`); return; }
@@ -513,6 +516,10 @@ async function main() {
   const callerDir = process.cwd();
   BLACKOUT = parseBlackout(process.env.RELEASE_TRAIN_BLACKOUT ?? trainConfig(callerDir).blackout);
   BUSY_CHECK = process.env.RELEASE_TRAIN_BUSY_CHECK ?? (trainConfig(callerDir).busyCheck || null);
+  // v0.8.8: and from the release clone (main) when the caller's checkout is older and has none
+  if (process.env.RELEASE_TRAIN_BUSY_CHECK === undefined && !BUSY_CHECK) {
+    try { BUSY_CHECK = trainConfig(cloneDirFor(callerDir)).busyCheck || null; } catch { /* no clone yet */ }
+  }
   for (const [k, v] of Object.entries(trainConfig(callerDir).env || {})) {
     if (k === 'NODE_OPTIONS') process.env[k] = [process.env[k], v].filter(Boolean).join(' ');
     else if (process.env[k] === undefined) process.env[k] = String(v);
