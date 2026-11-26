@@ -35,8 +35,9 @@
 //                                            there (TomicFunds: daily run, model release) that a service restart
 //                                            would break off; the train waits until it is empty. Errors count as
 //                                            free. RELEASE_TRAIN_BUSY_CHECK overrides it, RELEASE_IGNORE_BUSY=1
-//                                            skips it, RELEASE_TRAIN_MAX_BUSY_MIN
-//                                            (default 240) ends the wait with an error; --rollback ignores it.
+//                                            skips it, RELEASE_TRAIN_MAX_BUSY_MIN or "maxBusyMin" (default
+//                                            240, 0 = no limit, v0.8.9) ends the wait with an error; --rollback
+//                                            ignores it.
 //   --push    HEAD not on origin yet: rebase onto origin/<branch> and push HEAD:<branch> (3 attempts)
 //   --sha     wait for this commit instead of HEAD
 //   --latest  release whatever origin/<branch> is now (default when run inside the release clone)
@@ -210,6 +211,7 @@ async function drive(ssh, b0, cloneDir, target) {
   // v0.8.8: the busy check of what is being built (main in the release clone), not only the caller's own checkout:
   // a session with an older checkout knew no busy check and deployed into a running model release (26.11.2026)
   if (process.env.RELEASE_TRAIN_BUSY_CHECK === undefined) BUSY_CHECK = trainConfig(cloneDir).busyCheck || BUSY_CHECK;
+  if (trainConfig(cloneDir).maxBusyMin !== undefined) MAX_BUSY_MIN = trainConfig(cloneDir).maxBusyMin;   // v0.8.9: main decides
 
   const state = await readState(ssh, b, target);
   if (state.commit && isAncestor(tip, state.commit, cloneDir)) { log(`✅ ${tip.slice(0, 7)} is already live (${state.version}).`); return; }
@@ -276,7 +278,7 @@ async function drive(ssh, b0, cloneDir, target) {
     const busy = await serverBusy(ssh);
     if (!busy) break;
     if (said !== busy.replace(/\d+/g, '#')) { log(`⏸ Built ${version}, but the server is busy (${busy}) — deploying when it is done.`); said = busy.replace(/\d+/g, '#'); }
-    if (Date.now() - t0 > MAX_BUSY()) throw new Error(`Server still busy after ${MAX_BUSY() / 60_000} min (${busy}); ${version} is built and tagged but not deployed. RELEASE_IGNORE_BUSY=1 deploys anyway.`);
+    if (Date.now() - t0 > MAX_BUSY()) throw new Error(`Server still busy after ${Math.round(MAX_BUSY() / 60_000)} min (${busy}); ${version} is built and tagged but not deployed. RELEASE_IGNORE_BUSY=1 deploys anyway.`);
     await sleep(POLL_MS);
   }
   try { await runDeploy({ ...b, viaTrain: true, packageJson: { ...pkg, version } }); }
@@ -337,7 +339,7 @@ async function runTrain(agentDir, target, forcePush) {
   log(`🎫 Waiting for ${want.slice(0, 7)} to be live on ${target} (train ${cloneDir})`);
 
   const maxWait = Number(process.env.RELEASE_TRAIN_MAX_WAIT_MIN || 90) * 60_000;
-  const start = Date.now();
+  let start = Date.now();
   let lastHeld = '';
   let busySince = null;   // busy waits have their own limit (MAX_BUSY), the train limit counts only the rest
   // the live commit may be newer than our last fetch (another machine drove): fetch once if it is unknown here
@@ -377,11 +379,12 @@ async function runTrain(agentDir, target, forcePush) {
         // v0.8.7: report once per kind of job, not on every progress count ("… 2304 von 2579" changed each poll)
         const kind = 'busy:' + busy.replace(/\d+/g, '#');
         if (lastHeld !== kind) { log(`⏸ Server busy (${busy}) — the train waits until it is done.`); lastHeld = kind; }
-        if (Date.now() - busySince > MAX_BUSY()) throw Object.assign(new Error(`Server still busy after ${MAX_BUSY() / 60_000} min (${busy}). RELEASE_IGNORE_BUSY=1 releases anyway.`), { fatal: true });
+        if (Date.now() - busySince > MAX_BUSY()) throw Object.assign(new Error(`Server still busy after ${Math.round(MAX_BUSY() / 60_000)} min (${busy}). RELEASE_IGNORE_BUSY=1 releases anyway.`), { fatal: true });
         ssh.dispose();
         await sleep(POLL_MS);
         continue;
       }
+      if (busySince !== null) start += Date.now() - busySince;   // v0.8.9: waiting for a busy server does not count
       busySince = null;
       r = await tryAcquireReleaseLock(ssh, { REMOTE_BASE_PATH: b.REMOTE_BASE_PATH, target, log });
     } catch (e) {
@@ -483,7 +486,11 @@ async function serverBusy(ssh) {
     return r.code === 0 && out ? out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).join('; ') : null;
   } catch { return null; }   // a broken check must never block every release
 }
-const MAX_BUSY = () => Number(process.env.RELEASE_TRAIN_MAX_BUSY_MIN || 240) * 60_000;
+let MAX_BUSY_MIN = null;   // package.json releaseTrain.maxBusyMin — filled in main(); 0 = no limit (v0.8.9)
+const MAX_BUSY = () => {
+  const min = Number(process.env.RELEASE_TRAIN_MAX_BUSY_MIN ?? MAX_BUSY_MIN ?? 240);
+  return min > 0 ? min * 60_000 : Infinity;
+};
 function parseBlackout(list) {
   return (Array.isArray(list) ? list : String(list || '').split(','))
     .map((w) => String(w).trim().match(/^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/))
@@ -516,6 +523,7 @@ async function main() {
   const callerDir = process.cwd();
   BLACKOUT = parseBlackout(process.env.RELEASE_TRAIN_BLACKOUT ?? trainConfig(callerDir).blackout);
   BUSY_CHECK = process.env.RELEASE_TRAIN_BUSY_CHECK ?? (trainConfig(callerDir).busyCheck || null);
+  MAX_BUSY_MIN = trainConfig(callerDir).maxBusyMin ?? null;
   // v0.8.8: and from the release clone (main) when the caller's checkout is older and has none
   if (process.env.RELEASE_TRAIN_BUSY_CHECK === undefined && !BUSY_CHECK) {
     try { BUSY_CHECK = trainConfig(cloneDirFor(callerDir)).busyCheck || null; } catch { /* no clone yet */ }
